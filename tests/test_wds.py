@@ -9,7 +9,7 @@ from PIL import Image
 import torch
 from torchvision import transforms
 
-from open_clip_train.data import get_wds_dataset
+from open_clip_train.data import get_wds_dataset, group_by_keys_nothrow
 from open_clip_train.params import parse_args
 from open_clip_train.main import random_seed
 
@@ -78,6 +78,23 @@ def get_dataloader(input_shards):
     dataset = get_wds_dataset(args, preprocess_img, is_train=True, tokenizer=tokenizer)
     dataloader = dataset.dataloader
     return dataloader
+
+
+def test_group_by_keys_nothrow_handles_eof_marker():
+    data = iter([
+        {"fname": "0.jpg", "data": b"image", "__url__": "0.tar"},
+        {"fname": "0.txt", "data": b"caption", "__url__": "0.tar"},
+        {},
+        {"fname": "0.jpg", "data": b"image2", "__url__": "1.tar"},
+        {"fname": "0.txt", "data": b"caption2", "__url__": "1.tar"},
+        {},
+    ])
+
+    samples = list(group_by_keys_nothrow(data))
+
+    assert [sample["__url__"] for sample in samples] == ["0.tar", "1.tar"]
+    assert [sample["jpg"] for sample in samples] == [b"image", b"image2"]
+    assert [sample["txt"] for sample in samples] == [b"caption", b"caption2"]
 
 
 def test_single_source():

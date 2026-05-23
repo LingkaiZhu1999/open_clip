@@ -272,22 +272,38 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
     """
     current_sample = None
     for filesample in data:
-        assert isinstance(filesample, dict)
-        fname, value = filesample["fname"], filesample["data"]
-        prefix, suffix = keys(fname)
-        if prefix is None:
-            continue
-        if lcase:
-            suffix = suffix.lower()
-        # FIXME webdataset version throws if suffix in current_sample, but we have a potential for
-        #  this happening in the current LAION400m dataset if a tar ends with same prefix as the next
-        #  begins, rare, but can happen since prefix aren't unique across tar files in that dataset
-        if current_sample is None or prefix != current_sample["__key__"] or suffix in current_sample:
-            if valid_sample(current_sample):
-                yield current_sample
-            current_sample = dict(__key__=prefix, __url__=filesample["__url__"])
-        if suffixes is None or suffix in suffixes:
-            current_sample[suffix] = value
+        try:
+            assert isinstance(filesample, dict)
+            if filesample == {}:
+                if valid_sample(current_sample):
+                    yield current_sample
+                current_sample = None
+                continue
+            fname, value = filesample["fname"], filesample["data"]
+            prefix, suffix = keys(fname)
+            if prefix is None:
+                continue
+            if lcase:
+                suffix = suffix.lower()
+            # FIXME webdataset version throws if suffix in current_sample, but we have a potential for
+            #  this happening in the current LAION400m dataset if a tar ends with same prefix as the next
+            #  begins, rare, but can happen since prefix aren't unique across tar files in that dataset
+            if current_sample is None or prefix != current_sample["__key__"] or suffix in current_sample:
+                if valid_sample(current_sample):
+                    yield current_sample
+                current_sample = dict(__key__=prefix, __url__=filesample["__url__"])
+                local_path = filesample.get("__local_path__")
+                if local_path is not None:
+                    current_sample["__local_path__"] = local_path
+            if suffixes is None or suffix in suffixes:
+                current_sample[suffix] = value
+        except Exception as exn:
+            if isinstance(filesample, dict):
+                exn.args = exn.args + (filesample.get("stream"), filesample.get("url"))
+            if handler is not None and handler(exn):
+                continue
+            else:
+                raise
     if valid_sample(current_sample):
         yield current_sample
 
