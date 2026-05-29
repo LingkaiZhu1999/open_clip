@@ -26,6 +26,12 @@ The model was trained with the following configuration:
 
 Additional specific performance-enhancing flags enabled during training: `--torchcompile`, `--local-loss`, and `--gather-with-grad`.
 
+## Evaluation
+
+- **Eval Epoch**: 0
+- **imagenet-zeroshot-val-top1**: 0.6086
+- **imagenet-zeroshot-val-top5**: 0.8632
+
 ## Usage
 
 ```python
