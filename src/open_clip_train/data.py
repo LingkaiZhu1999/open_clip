@@ -203,7 +203,28 @@ def get_imagenet(args, preprocess_fns, split, naflex_data_config=None):
             preprocess_fn = preprocess_val
             
         if data_path:
-            if data_path.startswith("hf:") or data_path == "ILSVRC/imagenet-1k":
+            is_wds = ('{' in data_path or '*' in data_path or data_path.endswith('.tar'))
+            if is_wds:
+                pipeline = [wds.SimpleShardList(data_path)]
+                pipeline.extend([
+                    wds.split_by_worker,
+                    wds.tarfile_to_samples(handler=log_and_continue),
+                    wds.decode("pilrgb", handler=log_and_continue),
+                    wds.rename(image="jpg;png;jpeg;webp", label="cls"),
+                    wds.map_dict(image=preprocess_fn, label=lambda x: int(x)),
+                    wds.to_tuple("image", "label"),
+                    wds.batched(args.batch_size, partial=not is_train, collation_fn=collate_fn or default_collate),
+                ])
+                dataset = wds.DataPipeline(*pipeline)
+                dataloader = wds.WebLoader(
+                    dataset,
+                    batch_size=None,
+                    shuffle=False,
+                    num_workers=args.workers,
+                    persistent_workers=args.workers > 0,
+                )
+                return DataInfo(dataloader=dataloader, sampler=None)
+            elif data_path.startswith("hf:") or data_path == "ILSVRC/imagenet-1k":
                 from datasets import load_dataset
                 ds_name = data_path.replace("hf:", "") if data_path.startswith("hf:") else "ILSVRC/imagenet-1k"
                 hf_split = "train" if is_train else "validation"
