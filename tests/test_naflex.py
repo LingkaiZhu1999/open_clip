@@ -8,13 +8,18 @@ from PIL import Image
 from torchvision import transforms
 
 import open_clip
-from open_clip.transform import image_transform
+from open_clip.model_traits import CLIP_TRAITS
+from open_clip.naflex_config import NaFlexDataConfig
+from open_clip.transform import NaFlexEvalTransformFactory, image_transform
 from open_clip_train.data import get_imagenet, get_wds_dataset
 from open_clip_train.naflex_data import (
     NAFLEX_AVAILABLE,
     NaFlexBatcher,
+    SampleDecodeError,
+    collate_naflex_dicts,
     collate_naflex_tuples,
     create_naflex_data_config_from_args,
+    create_naflex_eval_transform,
 )
 from open_clip_train.params import parse_args
 from open_clip_train.train import get_naflex_loss_scale
@@ -38,6 +43,16 @@ def _samples(num_samples=4):
         }
         for idx in range(num_samples)
     ]
+
+
+class _MaskTokenizer:
+    """Fixed-length tokenizer whose validity cannot be inferred from token values."""
+
+    def __call__(self, text, output_mask=False):
+        value = int(text.strip())
+        tokens = torch.tensor([[value, 0, 2, 0]], dtype=torch.long)
+        valid = torch.tensor([[True, True, True, False]])
+        return (tokens, valid) if output_mask else tokens
 
 
 def _write_tar(path, num_samples=4):
@@ -80,6 +95,157 @@ def test_naflex_batcher_returns_dict_batches():
     assert batch["text"].shape == (2, 1)
 
 
+def test_naflex_batcher_preserves_fixed_text_valid():
+    samples = _samples(2)
+    expected = []
+    for idx, sample in enumerate(samples):
+        sample["text"] = torch.tensor([idx, 0, 2, 0], dtype=torch.long)
+        sample["text_valid"] = torch.tensor([True, True, True, False])
+        expected.append(sample["text_valid"])
+
+    batcher = NaFlexBatcher(
+        train_num_samples=2,
+        patch_size=16,
+        seq_lens=(4,),
+        max_tokens_per_batch=8,
+        transform_factory=_transform_factory,
+        batch_divisor=1,
+        shuffle=False,
+    )
+    batch = next(batcher.run(samples))
+
+    torch.testing.assert_close(batch["text_valid"], torch.stack(expected))
+
+
+def test_collate_naflex_dicts_preserves_fixed_text_valid():
+    batch = [
+        {
+            "image": {
+                "patches": torch.randn(4, 16 * 16 * 3),
+                "patch_coord": torch.zeros(4, 2, dtype=torch.long),
+                "patch_valid": torch.ones(4, dtype=torch.bool),
+            },
+            "text": torch.tensor([idx, 0, 2, 0], dtype=torch.long),
+            "text_valid": torch.tensor([True, True, True, False]),
+        }
+        for idx in range(2)
+    ]
+
+    output = collate_naflex_dicts(batch, max_seq_len=4)
+
+    assert output["text_valid"].shape == (2, 4)
+    assert output["text_valid"].tolist() == [[True, True, True, False]] * 2
+
+
+# --- decode-in-loop (deferred decode + skip-and-replenish) ----------------------------------------------------
+_POISON = object()
+
+
+def _decode_to_pil(raw):
+    """Fake per-modality decode: a raw int token -> PIL; the poison sentinel raises like a corrupt byte stream."""
+    if raw is _POISON:
+        raise ValueError("corrupt bytes")
+    v = raw % 256
+    return Image.new("RGB", (32, 32), color=(v, v, v))
+
+
+def test_naflex_batcher_decode_fn_in_loop_matches_predecoded():
+    """Decoding raw samples via `decode_fn` inside the batcher loop yields the same batches as feeding
+    already-decoded PILs with `decode_fn=None` (the refactor is behavior-preserving)."""
+    common = dict(
+        train_num_samples=4, patch_size=16, seq_lens=(4,), max_tokens_per_batch=8,
+        transform_factory=_transform_factory, batch_divisor=1, shuffle=False,
+    )
+    raw = [{"image": i, "text": torch.tensor([i], dtype=torch.long)} for i in range(4)]
+    decoded = [{"image": _decode_to_pil(i), "text": torch.tensor([i], dtype=torch.long)} for i in range(4)]
+
+    b_in_loop = list(NaFlexBatcher(**common, decode_fn=_decode_to_pil).run(iter(raw)))
+    b_predecoded = list(NaFlexBatcher(**common).run(iter(decoded)))
+
+    assert len(b_in_loop) == len(b_predecoded) == 2
+    for a, b in zip(b_in_loop, b_predecoded):
+        assert torch.equal(a["image"]["patches"], b["image"]["patches"])
+        assert torch.equal(a["text"], b["text"])
+
+
+def test_naflex_batcher_skips_and_replenishes_decode_failures():
+    """A SampleDecodeError is skipped and replenished so every batch stays exactly `batch_size`, and the
+    decode_error_handler is invoked once per skipped sample."""
+    skipped = []
+    batcher = NaFlexBatcher(
+        train_num_samples=4, patch_size=16, seq_lens=(4,), max_tokens_per_batch=8,
+        transform_factory=_transform_factory, batch_divisor=1, shuffle=False,
+        decode_fn=_decode_to_pil, decode_error_handler=lambda ex: skipped.append(ex) or True,  # truthy -> skip
+    )
+
+    def src():  # infinite source; every 3rd sample is poison
+        i = 0
+        while True:
+            i += 1
+            yield {"image": (_POISON if i % 3 == 0 else i), "text": torch.tensor([i % 7], dtype=torch.long)}
+
+    batches = list(batcher.run(src()))
+    assert len(batches) == 2
+    for batch in batches:
+        assert batch["image"]["patches"].shape[0] == 2  # exactly batch_size despite the skipped poison
+    assert len(skipped) >= 1 and all(isinstance(ex, SampleDecodeError) for ex in skipped)
+
+
+def test_naflex_batcher_raises_after_consecutive_decode_failures(monkeypatch):
+    """A fully-failing decode trips the consecutive-failure guard (no infinite spin against the infinite source)."""
+    from open_clip_train import naflex_data as nd
+    monkeypatch.setattr(nd, "_MAX_CONSECUTIVE_DECODE_FAILURES", 3)
+
+    def always_fail(raw):
+        raise ValueError("decode always fails")
+
+    batcher = nd.NaFlexBatcher(
+        train_num_samples=4, patch_size=16, seq_lens=(4,), max_tokens_per_batch=8,
+        transform_factory=_transform_factory, batch_divisor=1, shuffle=False,
+        decode_fn=always_fail, decode_error_handler=lambda ex: True,  # keep skipping -> accumulate to the guard
+    )
+
+    def src():
+        i = 0
+        while True:
+            i += 1
+            yield {"image": i, "text": torch.tensor([0], dtype=torch.long)}
+
+    with pytest.raises(SampleDecodeError):
+        list(batcher.run(src()))
+
+
+def test_naflex_batcher_decode_error_handler_false_reraises():
+    """A decode_error_handler returning a falsy value re-raises immediately (webdataset handler convention),
+    instead of skipping -- so a caller can opt into fail-fast on bad data."""
+    batcher = NaFlexBatcher(
+        train_num_samples=4, patch_size=16, seq_lens=(4,), max_tokens_per_batch=8,
+        transform_factory=_transform_factory, batch_divisor=1, shuffle=False,
+        decode_fn=_decode_to_pil, decode_error_handler=lambda ex: False,
+    )
+    src = iter([{"image": _POISON, "text": torch.tensor([0], dtype=torch.long)}])
+    with pytest.raises(SampleDecodeError):
+        list(batcher.run(src))
+
+
+def test_naflex_batcher_drop_last_governs_trailing_partial_batch():
+    """On source exhaustion mid-batch, drop_last=True (train default) drops the short batch so DDP never sees an
+    uneven shape; drop_last=False (eval) keeps it. Full batches always yield."""
+    common = dict(
+        train_num_samples=4, patch_size=16, seq_lens=(4,), max_tokens_per_batch=8,  # schedule = 2 batches of 2
+        transform_factory=_transform_factory, batch_divisor=1, shuffle=False,
+    )
+
+    def three_samples():  # only 3 -> batch 0 full (2), batch 1 partial (1)
+        return iter([{"image": _decode_to_pil(i), "text": torch.tensor([i], dtype=torch.long)} for i in range(3)])
+
+    dropped = list(NaFlexBatcher(**common, drop_last=True).run(three_samples()))
+    assert len(dropped) == 1 and dropped[0]["image"]["patches"].shape[0] == 2  # partial 2nd batch dropped
+
+    kept = list(NaFlexBatcher(**common, drop_last=False).run(three_samples()))
+    assert len(kept) == 2 and kept[1]["image"]["patches"].shape[0] == 1  # partial 2nd batch kept
+
+
 def test_naflex_batcher_token_schedule_handles_distributed_padding():
     batcher = NaFlexBatcher(
         train_num_tokens=17,
@@ -112,6 +278,28 @@ def test_naflex_batcher_pads_schedule_to_worker_count():
     assert batcher.num_batches == 1
     assert batcher.num_batches_for_workers(4) == 4
     assert batcher.num_samples_for_workers(4) == 4
+
+
+def test_naflex_batcher_worker_padded_sample_count_matches_shuffled_epochs():
+    """Padding before shuffling keeps the advertised worker-padded sample count stable across epochs."""
+    batcher = NaFlexBatcher(
+        train_num_samples=17,
+        patch_size=16,
+        seq_lens=(4, 8, 16),
+        seq_len_choice_probs=(1, 2, 1),
+        max_tokens_per_batch=32,
+        transform_factory=_transform_factory,
+        batch_divisor=1,
+        seed=7,
+        shuffle=True,
+    )
+
+    expected_samples = batcher.num_samples_for_workers(4)
+    expected_batches = batcher.num_batches_for_workers(4)
+    for epoch in range(5):
+        schedule = batcher.scheduler.epoch_schedule(epoch, num_workers=4)
+        assert len(schedule) == expected_batches
+        assert sum(batch_size for _, batch_size in schedule) == expected_samples
 
 
 def test_image_transform_naflex_returns_timm_transform_factory():
@@ -156,7 +344,7 @@ def test_parse_naflex_args():
         "--naflex-seq-lens",
         "128",
         "256",
-        "--naflex-max-image-tokens-per-batch",
+        "--naflex-max-tokens-per-batch",
         "4096",
         "--naflex-batch-divisor",
         "4",
@@ -165,19 +353,75 @@ def test_parse_naflex_args():
     ])
 
     assert args.use_naflex
+    assert args.force_naflex_patch_interp is True  # auto-enabled: more than one patch size listed
     assert args.naflex_num_train_image_tokens == 1024
     assert args.naflex_patch_sizes == [16, 32]
     assert args.naflex_patch_size_probs == [0.25, 0.75]
     assert args.naflex_seq_lens == [128, 256]
-    assert args.naflex_max_image_tokens_per_batch == 4096
+    assert args.naflex_max_tokens_per_batch == 4096
     assert args.naflex_batch_divisor == 4
     assert args.naflex_loss_scale == "sqrt"
+
+
+def test_naflex_patchify_flattens_per_model_base_patch_size():
+    multi = NaFlexBatcher(
+        train_num_samples=1,
+        patch_size_choices=(16, 32),
+        model_patch_size=16,
+        seq_lens=(4,),
+        max_tokens_per_batch=4,
+        transform_factory=_transform_factory,
+        batch_divisor=1,
+        shuffle=False,
+    )
+    image = torch.randn(3, 64, 64)
+
+    base = multi.scheduler.patchifiers[0](image)["patches"]
+    non_base = multi.scheduler.patchifiers[1](image)["patches"]
+
+    assert base.shape == (16, 16 * 16 * 3)
+    assert non_base.shape == (4, 32, 32, 3)
+
+    fixed_non_base = NaFlexBatcher(
+        train_num_samples=1,
+        patch_size=32,
+        model_patch_size=16,
+        seq_lens=(4,),
+        max_tokens_per_batch=4,
+        transform_factory=_transform_factory,
+        batch_divisor=1,
+        shuffle=False,
+    )
+    assert fixed_non_base.scheduler.patchifiers[0](image)["patches"].shape == (4, 32, 32, 3)
+
+
+def test_naflex_eval_keeps_non_base_patch_dimensions():
+    factory = NaFlexEvalTransformFactory(
+        input_size=(3, 64, 64),
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+        interpolation="bilinear",
+    )
+    config = NaFlexDataConfig.resolve(
+        patch_sizes=[32],
+        seq_lens=[4],
+        model_patch_size=16,
+        supports_patch_interpolation=True,
+    )
+
+    transform, max_seq_len, patch_size = create_naflex_eval_transform(factory, config)
+    image = transform(Image.new("RGB", (64, 64)))
+
+    assert max_seq_len == 4
+    assert patch_size == (32, 32)
+    assert image["patches"].shape == (4, 32, 32, 3)
 
 
 def test_naflex_loss_scale_defaults_to_none():
     args = parse_args([])
 
     assert args.naflex_loss_scale == "none"
+    assert args.naflex_max_tokens_per_batch is None
 
 
 def test_naflex_loss_scale_uses_actual_batch_size():
@@ -238,7 +482,6 @@ def test_get_wds_dataset_naflex_keeps_dictionary_contract(tmp_path):
         naflex_patch_sizes=[16],
         naflex_patch_size_probs=None,
         naflex_seq_lens=[4],
-        naflex_max_image_tokens_per_batch=8,
         naflex_batch_divisor=1,
         seed=0,
         workers=0,
@@ -246,8 +489,9 @@ def test_get_wds_dataset_naflex_keeps_dictionary_contract(tmp_path):
         distributed=False,
         rank=0,
         world_size=1,
+        text_attention_mask=True,
     )
-    tokenizer = lambda text: [torch.tensor([int(text.strip())], dtype=torch.long)]
+    tokenizer = _MaskTokenizer()
 
     info = get_wds_dataset(
         args,
@@ -255,12 +499,14 @@ def test_get_wds_dataset_naflex_keeps_dictionary_contract(tmp_path):
         is_train=True,
         tokenizer=tokenizer,
         naflex_data_config=create_naflex_data_config_from_args(args),
+        model_traits=CLIP_TRAITS,
     )
     batch = next(iter(info.dataloader))
 
-    assert set(batch.keys()) == {"image", "text"}
+    assert set(batch.keys()) == {"image", "text", "text_valid"}
     assert batch["image"]["patches"].shape == (2, 4, 16 * 16 * 3)
-    assert batch["text"].shape == (2, 1)
+    assert batch["text"].shape == (2, 4)
+    assert batch["text_valid"].tolist() == [[True, True, True, False]] * 2
 
 
 def test_get_wds_dataset_naflex_rolls_over_non_resampled_input(tmp_path):
@@ -279,7 +525,7 @@ def test_get_wds_dataset_naflex_rolls_over_non_resampled_input(tmp_path):
         naflex_patch_sizes=[16],
         naflex_patch_size_probs=None,
         naflex_seq_lens=[4],
-        naflex_max_image_tokens_per_batch=8,
+        naflex_max_tokens_per_batch=8,
         naflex_batch_divisor=1,
         seed=0,
         workers=0,
@@ -296,6 +542,7 @@ def test_get_wds_dataset_naflex_rolls_over_non_resampled_input(tmp_path):
         is_train=True,
         tokenizer=tokenizer,
         naflex_data_config=create_naflex_data_config_from_args(args),
+        model_traits=CLIP_TRAITS,
     )
     batches = list(info.dataloader)
 
@@ -341,7 +588,7 @@ def test_get_wds_dataset_naflex_eval_outputs_patched_image_dict(tmp_path):
         naflex_patch_sizes=[16],
         naflex_patch_size_probs=None,
         naflex_seq_lens=[4],
-        naflex_max_image_tokens_per_batch=8,
+        naflex_max_tokens_per_batch=8,
         naflex_batch_divisor=1,
         seed=0,
         workers=0,
@@ -349,8 +596,9 @@ def test_get_wds_dataset_naflex_eval_outputs_patched_image_dict(tmp_path):
         distributed=False,
         rank=0,
         world_size=1,
+        text_attention_mask=True,
     )
-    tokenizer = lambda text: [torch.tensor([int(text.strip())], dtype=torch.long)]
+    tokenizer = _MaskTokenizer()
 
     info = get_wds_dataset(
         args,
@@ -358,14 +606,16 @@ def test_get_wds_dataset_naflex_eval_outputs_patched_image_dict(tmp_path):
         is_train=False,
         tokenizer=tokenizer,
         naflex_data_config=create_naflex_data_config_from_args(args),
+        model_traits=CLIP_TRAITS,
     )
     batch = next(iter(info.dataloader))
 
-    assert set(batch.keys()) == {"image", "text"}
+    assert set(batch.keys()) == {"image", "text", "text_valid"}
     assert batch["image"]["patches"].shape == (2, 4, 16 * 16 * 3)
     assert batch["image"]["patch_coord"].shape == (2, 4, 2)
     assert batch["image"]["patch_valid"].all()
-    assert batch["text"].shape == (2, 1)
+    assert batch["text"].shape == (2, 4)
+    assert batch["text_valid"].tolist() == [[True, True, True, False]] * 2
 
 
 def test_get_imagenet_naflex_eval_outputs_patched_image_dict(tmp_path):

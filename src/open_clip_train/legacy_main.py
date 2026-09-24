@@ -1,13 +1,8 @@
 import copy
-import glob
 import logging
 import os
-import re
-import subprocess
 import sys
-import random
 from datetime import datetime
-from functools import partial
 
 import numpy as np
 import torch
@@ -23,56 +18,38 @@ try:
 except ImportError:
     tensorboard = None
 
-from open_clip import create_model_and_transforms, get_model_config, get_tokenizer, create_loss
-from open_clip_train.data import get_data
+from open_clip import create_model_and_transforms, get_tokenizer, get_model_traits
+from open_clip_train.loss import create_loss_from_args as create_loss
+from open_clip_train.legacy_data import get_data_legacy as get_data
 from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object
 from open_clip_train.naflex_data import (
     create_naflex_data_config_from_args,
     get_naflex_model_image_seq_len,
     get_naflex_model_patch_size,
+    get_naflex_model_supports_patch_interpolation,
+    prewarm_naflex_patch_interpolator,
 )
 from open_clip_train.logger import setup_logging
-from open_clip_train.params import parse_args
+from open_clip_train.params import parse_args, apply_model_traits
+from open_clip_train.utils import random_seed
+from open_clip_train.file_utils import (
+    copy_codebase, get_latest_checkpoint as _get_latest_checkpoint, pt_load, start_sync_process, remote_sync,
+)
 from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from open_clip_train.legacy_train import train_one_epoch, evaluate
-from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
 
-def random_seed(seed=42, rank=0):
-    torch.manual_seed(seed + rank)
-    np.random.seed(seed + rank)
-    random.seed(seed + rank)
-
-
-def natural_key(string_):
-    """See http://www.codinghorror.com/blog/archives/001018.html"""
-    return [int(s) if s.isdigit() else s for s in re.split(r'(\d+)', string_.lower())]
-
-
-def get_latest_checkpoint(path: str, remote : bool):
-    # as writen, this glob recurses, so can pick up checkpoints across multiple sub-folders
-    if remote:
-        result = subprocess.run(["aws", "s3", "ls", path + "/"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(result)
-        if result.returncode == 1:
-            return None
-        checkpoints = [os.path.join(path, x.split(' ')[-1]) for x in result.stdout.decode().split('\n')[:-1]]
-    else:
-        checkpoints = glob.glob(path + '**/*.pt', recursive=True)
-    if checkpoints:
-        checkpoints = sorted(checkpoints, key=natural_key)
-        return checkpoints[-1]
-    return None
+def get_latest_checkpoint(path: str, remote: bool):
+    return _get_latest_checkpoint(path, remote, include_sharded=False)
 
 
 def main(args):
     args = parse_args(args)
-    model_cfg = get_model_config(args.model) or {}
-    if args.dataset_type in ("webdataset-audio", "synthetic-audio") or "audio_cfg" in model_cfg:
-        raise NotImplementedError("CLAP audio training is only supported by open_clip_train.main.")
+    if args.dataset_type in ("webdataset-audio", "synthetic-audio"):
+        raise NotImplementedError("Audio training is only supported by open_clip_train.main.")
 
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
@@ -208,8 +185,7 @@ def main(args):
     if args.distill:
         #FIXME: support distillation with grad accum.
         assert args.accum_freq == 1
-        #FIXME: support distillation with coca.
-        assert 'coca' not in args.model.lower()
+        # generative students are rejected in apply_model_traits, post-creation
 
     if isinstance(args.force_image_size, (tuple, list)) and len(args.force_image_size) == 1:
         # arg is nargs, single (square) image size list -> int
@@ -235,11 +211,14 @@ def main(args):
         image_resize_mode=args.image_resize_mode,  # only effective for inference
         aug_cfg=args.aug_cfg,
         force_naflex_vision=args.force_naflex_vision,
+        force_naflex_patch_interp=args.force_naflex_patch_interp,
         pretrained_image=args.pretrained_image,
         output_dict=True,
         cache_dir=args.cache_dir,
         **model_kwargs,
     )
+    if hasattr(model, 'audio') or hasattr(model, 'audio_cfg'):
+        raise NotImplementedError("Audio training is only supported by open_clip_train.main.")
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
@@ -314,14 +293,16 @@ def main(args):
                 'When using timm optimizer, BOTH beta1 and beta2 must be specified (or not specified).'
             if args.beta1 is not None:
                 opt_kwargs['betas'] = (args.beta1, args.beta2)
+            if args.eps is not None:
+                opt_kwargs['eps'] = args.eps
             if args.momentum is not None:
                 opt_kwargs['momentum'] = args.momentum
+            opt_kwargs.update(args.opt_kwargs or {})
             optimizer = create_optimizer_v2(
                 model,
                 timm_opt,
                 lr=args.lr,
                 weight_decay=args.wd,
-                eps=args.eps,
                 **opt_kwargs,
             )
         else:
@@ -334,14 +315,18 @@ def main(args):
             rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
 
             if opt == 'adamw':
+                opt_kwargs = dict(
+                    lr=args.lr,
+                    betas=(args.beta1, args.beta2),
+                    eps=args.eps,
+                )
+                opt_kwargs.update(args.opt_kwargs or {})
                 optimizer = optim.AdamW(
                     [
                         {"params": gain_or_bias_params, "weight_decay": 0.},
                         {"params": rest_params, "weight_decay": args.wd},
                     ],
-                    lr=args.lr,
-                    betas=(args.beta1, args.beta2),
-                    eps=args.eps,
+                    **opt_kwargs,
                 )
             else:
                 assert False, f'Unknown optimizer {opt}'
@@ -383,17 +368,28 @@ def main(args):
             logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
 
     # initialize datasets
+    # Mirror main.py: combine the built model's traits with the user flags (get_model_traits sees through DDP).
+    model_traits = get_model_traits(model)
+    apply_model_traits(args, model_traits)
     tokenizer = get_tokenizer(args.model, cache_dir=args.cache_dir, context_length=args.force_context_length)
     naflex_patch_size = get_naflex_model_patch_size(model) if args.use_naflex else None
+    naflex_patch_interpolation = (
+        get_naflex_model_supports_patch_interpolation(model) if args.use_naflex else None
+    )
     naflex_eval_seq_len = get_naflex_model_image_seq_len(model) if args.use_naflex else None
     naflex_data_config = (
         create_naflex_data_config_from_args(
             args,
             default_patch_size=naflex_patch_size,
             default_eval_seq_len=naflex_eval_seq_len,
+            supports_patch_interpolation=naflex_patch_interpolation,
         )
         if args.use_naflex else None
     )
+    if naflex_data_config is not None and prewarm_naflex_patch_interpolator(model, naflex_data_config):
+        # Model is on its device and cast here, before DDP/FSDP/compile: fill timm's patch-weight resampling
+        # cache now so the first non-base-patch forward does not trigger a recompile.
+        logging.info('Prewarmed NaFlex patch interpolator for non-base patch sizes.')
     data = get_data(
         args,
         (preprocess_train, preprocess_val),
@@ -486,7 +482,7 @@ def main(args):
         evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
-    loss = create_loss(args)
+    loss = create_loss(args, model=original_model)
 
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):
@@ -551,23 +547,6 @@ def main(args):
             logging.info('Final remote sync successful.')
         else:
             logging.info('Final remote sync failed.')
-
-
-def copy_codebase(args):
-    from shutil import copytree, ignore_patterns
-    new_code_path = os.path.join(args.logs, args.name, "code")
-    if os.path.exists(new_code_path):
-        print(
-            f"Error. Experiment already exists at {new_code_path}. Use --name to specify a new experiment."
-        )
-        return -1
-    print(f"Copying codebase to {new_code_path}")
-    current_code_path = os.path.realpath(__file__)
-    for _ in range(3):
-        current_code_path = os.path.dirname(current_code_path)
-    copytree(current_code_path, new_code_path, ignore=ignore_patterns('log', 'logs', 'wandb'))
-    print("Done copying code.")
-    return 1
 
 
 if __name__ == "__main__":

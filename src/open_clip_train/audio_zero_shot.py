@@ -1,26 +1,32 @@
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 
-from open_clip import build_zero_shot_classifier, get_input_dtype, get_tokenizer
-from open_clip.audio.transform import audio_transform_v2
+from open_clip import build_zero_shot_classifier, get_tokenizer
+from open_clip.audio.transform import audio_transform_v2, create_dummy_audio, stack_audio_inputs
 from open_clip.task import get_model_from_task
+from open_clip.utils import move_to_device
 from open_clip_train.precision import get_autocast
-from open_clip_train.zero_shot import accuracy
+from open_clip_train.eval_utils import run_classification_eval
 
 _logger = logging.getLogger(__name__)
 
+AUDIO_ZEROSHOT_TEMPLATES_ALT = (
+    "A sound of {}.",
+    "The sound of {}.",
+    "Audio of {}.",
+    "A recording of {}.",
+    "The sound of a {}.",
+    "This is a sound of {}.",
+)
+
 AUDIO_ZEROSHOT_TEMPLATES = (
-    "a sound of {}",
-    "the sound of {}",
-    "audio of {}",
-    "a recording of {}",
-    "the sound of a {}",
+    "This is a sound of {}.",
 )
 
 
@@ -92,44 +98,17 @@ def _get_target_map(dataset, target_key: str) -> Dict[int, int]:
     return _get_classnames_and_target_map(dataset, target_key, None)[1]
 
 
-def _move_to_device(value, device, input_dtype=None):
-    if isinstance(value, torch.Tensor):
-        if value.is_floating_point():
-            return value.to(device=device, dtype=input_dtype, non_blocking=True)
-        return value.to(device=device, non_blocking=True)
-    if isinstance(value, dict):
-        return {key: _move_to_device(val, device, input_dtype) for key, val in value.items()}
-    return value
-
-
 def _prepare_audio(model_or_task, audio, device, input_dtype=None):
     if hasattr(model_or_task, "prepare_batch"):
         return model_or_task.prepare_batch({"audio": audio}, device, input_dtype)["audio"]
-    return _move_to_device(audio, device, input_dtype)
+    return move_to_device(audio, device, input_dtype)
 
 
 def _create_dummy_audio(model_or_task, device, input_dtype=None):
     if hasattr(model_or_task, "create_dummy_batch"):
         return model_or_task.create_dummy_batch(batch_size=1, device=device, dtype=input_dtype)["audio"]
-
     model = get_model_from_task(model_or_task)
-    audio_cfg = model.audio.cfg
-    dummy_audio = {
-        "waveform": torch.zeros(1, audio_cfg.clip_samples, device=device, dtype=input_dtype),
-        "longer": torch.zeros(1, dtype=torch.bool, device=device),
-    }
-    if audio_cfg.enable_fusion:
-        from open_clip.audio.transform import get_audio_frame_count
-
-        dummy_audio["mel_fusion"] = torch.zeros(
-            1,
-            4,
-            get_audio_frame_count(audio_cfg),
-            audio_cfg.mel_bins,
-            device=device,
-            dtype=input_dtype,
-        )
-    return dummy_audio
+    return create_dummy_audio(model.audio.cfg, device=device, dtype=input_dtype)
 
 
 def _validate_audio_templates(templates: Sequence[str]) -> None:
@@ -197,15 +176,8 @@ class HFAudioClassificationDataset(Dataset):
 
 
 def _collate_audio_zero_shot(batch: Sequence[Dict]):
-    audio_items = [sample["audio"] for sample in batch]
-    audio_batch = {
-        "waveform": torch.stack([audio["waveform"] for audio in audio_items]),
-        "longer": torch.as_tensor([bool(audio["longer"]) for audio in audio_items], dtype=torch.bool),
-    }
-    if "mel_fusion" in audio_items[0]:
-        audio_batch["mel_fusion"] = torch.stack([audio["mel_fusion"] for audio in audio_items])
     return {
-        "audio": audio_batch,
+        "audio": stack_audio_inputs([sample["audio"] for sample in batch]),
         "target": torch.as_tensor([sample["target"] for sample in batch], dtype=torch.long),
     }
 
@@ -228,13 +200,40 @@ def build_hf_audio_zero_shot_dataset(args, model_or_task):
     classnames, target_map = _get_classnames_and_target_map(dataset, target_key=target_key, class_key=class_key)
 
     model = get_model_from_task(model_or_task)
-    audio_aug_cfg = {
-        "data_trunc": getattr(args, "audio_trunc", "rand_trunc"),
-        "data_fill": getattr(args, "audio_fill", "repeatpad"),
-        "enable_fusion": getattr(args, "audio_fusion", False),
-        "int16_normalize": getattr(args, "audio_int16_normalize", False),
-    }
-    transform = audio_transform_v2(model.audio.cfg, is_train=False, audio_aug_cfg=audio_aug_cfg)
+    if getattr(model.audio.cfg, "model_type", "").lower() == "naflexvit":
+        # NaFlexClap: the spectrogram-ViT tower consumes patchified mel ({patches, patch_coord, patch_valid}),
+        # NOT the HTSAT {waveform, longer}. Build the NaFlex audio transform + the pad-to-seq-len collate.
+        from open_clip.audio.naflex_audio import (
+            AudioNaFlexCfg, AudioNaFlexTransformFactory, naflex_audio_eval_seq_len)
+        from open_clip_train.naflex_data import collate_naflex_dicts
+
+        naflex_cfg = AudioNaFlexCfg.from_clip_audio_cfg(model.audio.cfg)
+        # Audio-token cap for the eval clips: explicit --naflex-seq-lens > the model config's audio_seq_len
+        # (mirror of vision_cfg.image_seq_len) > a geometry-derived ~10s default (vs the old hardcoded 256,
+        # which truncated clips past ~6s).
+        seq_lens = getattr(args, "naflex_seq_lens", None)
+        if seq_lens:
+            seq_len = max(seq_lens)
+        elif getattr(model.audio.cfg, "audio_seq_len", None):
+            seq_len = int(model.audio.cfg.audio_seq_len)
+        else:
+            seq_len = naflex_audio_eval_seq_len(naflex_cfg, 10.0)
+        secs = (seq_len / naflex_cfg.freq_tokens) * naflex_cfg.patch_time / 100.0
+        _logger.info(
+            "NaFlex audio zero-shot: capping eval clips at %d tokens (~%.0fs at this model's geometry); longer "
+            "clips are truncated. Override with --naflex-seq-lens.", seq_len, secs,
+        )
+        transform = AudioNaFlexTransformFactory(naflex_cfg)(max_seq_len=seq_len, patch_size=None)
+        collate_fn = partial(collate_naflex_dicts, primary_key="audio", target_key="target", max_seq_len=seq_len)
+    else:
+        audio_aug_cfg = {
+            "data_trunc": getattr(args, "audio_trunc", "rand_trunc"),
+            "data_fill": getattr(args, "audio_fill", "repeatpad"),
+            "enable_fusion": getattr(args, "audio_fusion", False),
+            "int16_normalize": getattr(args, "audio_int16_normalize", False),
+        }
+        transform = audio_transform_v2(model.audio.cfg, is_train=False, audio_aug_cfg=audio_aug_cfg)
+        collate_fn = _collate_audio_zero_shot
     wrapped = HFAudioClassificationDataset(
         dataset,
         transform,
@@ -257,76 +256,20 @@ def build_hf_audio_zero_shot_dataset(args, model_or_task):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=getattr(args, "device", "cpu") != "cpu",
-        collate_fn=_collate_audio_zero_shot,
+        collate_fn=collate_fn,
         **loader_kwargs,
     )
     return AudioZeroShotData(dataloader=dataloader, classnames=classnames, dataset_name=dataset_name)
 
 
 def run_audio_zero_shot_classifier(model, classifier, dataloader, args, use_fsdp_eval=False):
-    device = torch.device(args.device)
-    autocast = get_autocast(
-        args.precision,
-        device_type=device.type,
-        fsdp=getattr(args, "fsdp", False),
+    def prepare(batch, device, dtype):
+        return _prepare_audio(model, batch["audio"], device, dtype), batch["target"].to(device, non_blocking=True)
+
+    return run_classification_eval(
+        model, classifier, dataloader, args, input_key="audio", prepare_batch=prepare,
+        create_dummy=partial(_create_dummy_audio, model), use_fsdp_eval=use_fsdp_eval,
     )
-    input_dtype = get_input_dtype(args.precision)
-    is_rank0 = args.rank == 0
-
-    if use_fsdp_eval and not is_rank0:
-        dummy_audio = _create_dummy_audio(model, device=device, input_dtype=input_dtype)
-
-    with torch.inference_mode():
-        top1, top5, n = 0.0, 0.0, 0.0
-        top5_k = min(5, classifier.shape[1])
-
-        if use_fsdp_eval:
-            signal = torch.zeros(1, device=device, dtype=torch.long)
-            if is_rank0:
-                dataloader_iter = iter(dataloader)
-
-            while True:
-                if is_rank0:
-                    batch = next(dataloader_iter, None)
-                    signal.fill_(0 if batch is None else 1)
-                dist.broadcast(signal, src=0)
-                if signal.item() == 0:
-                    break
-
-                if is_rank0:
-                    audio = _prepare_audio(model, batch["audio"], device, input_dtype)
-                    target = batch["target"].to(device, non_blocking=True)
-                else:
-                    audio = dummy_audio
-
-                with autocast():
-                    output = model(audio=audio)
-                    audio_features = output["audio_features"] if isinstance(output, dict) else output[0]
-
-                if is_rank0:
-                    logits = 100.0 * audio_features @ classifier
-                    acc1, acc5 = accuracy(logits, target, topk=(1, top5_k))
-                    top1 += acc1
-                    top5 += acc5
-                    n += audio_features.shape[0]
-        else:
-            for batch in tqdm(dataloader, unit_scale=args.batch_size):
-                audio = _prepare_audio(model, batch["audio"], device, input_dtype)
-                target = batch["target"].to(device, non_blocking=True)
-
-                with autocast():
-                    output = model(audio=audio)
-                    audio_features = output["audio_features"] if isinstance(output, dict) else output[0]
-                    logits = 100.0 * audio_features @ classifier
-
-                acc1, acc5 = accuracy(logits, target, topk=(1, top5_k))
-                top1 += acc1
-                top5 += acc5
-                n += audio_features.shape[0]
-
-    top1 = (top1 / n) if n else 0.0
-    top5 = (top5 / n) if n else 0.0
-    return top1, top5
 
 
 def audio_zero_shot_eval(model_or_task, audio_data: Optional[AudioZeroShotData], epoch, args, tokenizer=None):

@@ -1,50 +1,27 @@
-import json
 import logging
 import math
-import os
 import time
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.nn.parallel.distributed import DistributedDataParallel
 
 try:
     import wandb
 except ImportError:
     wandb = None
 
-from open_clip import get_input_dtype, CLIP, CustomTextCLIP
+from open_clip import get_input_dtype
+from open_clip.utils import cat_padded_sequences
+from open_clip.task import unwrap_model
 from open_clip_train.distributed import is_master
+from open_clip_train import eval_utils
+from open_clip_train.metrics import DEFAULT_RETRIEVAL_CHUNK_SIZE
+from open_clip_train.metrics import get_clip_metrics
 from open_clip_train.zero_shot import zero_shot_eval
 from open_clip_train.precision import get_autocast
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
-def postprocess_clip_output(model_out):
-    return {
-        "image_features": model_out[0],
-        "text_features": model_out[1],
-        "logit_scale": model_out[2]
-    }
+from open_clip_train.utils import (
+    AverageMeter, backward, pop_accum_scalars, postprocess_clip_output as postprocess_clip_output,
+)
 
 
 def _coca_apply_ar_shift(model_out, texts):
@@ -60,20 +37,6 @@ def _coca_apply_ar_shift(model_out, texts):
         model_out["logits"] = model_out["logits"][:, :-1]
         model_out["labels"] = texts[:, 1:]
     return model_out
-
-
-def unwrap_model(model):
-    if hasattr(model, 'module'):
-        return model.module
-    else:
-        return model
-
-
-def backward(total_loss, scaler):
-    if scaler is not None:
-        scaler.scale(total_loss).backward()
-    else:
-        total_loss.backward()
 
 
 def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None):
@@ -157,19 +120,24 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
             for j in range(args.accum_freq):
                 images = accum_images[j]
                 texts = accum_texts[j]
+                is_last_step = j == args.accum_freq - 1
                 with autocast():
                     model_out = model(images, texts)
                     model_out = _coca_apply_ar_shift(model_out, texts)
 
-                    inputs_no_accum = {}
-                    inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
-                    if "logit_bias" in model_out:
-                        inputs_no_accum["logit_bias"] = model_out.pop("logit_bias")
+                    inputs_no_accum = pop_accum_scalars(model_out, is_last_step)
+                    logit_scale = inputs_no_accum["logit_scale"]
 
                     inputs = {}
                     for key, val in accum_features.items():
                         accumulated = accum_features[key]
-                        inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
+                        values = accumulated[:j] + [model_out[key]] + accumulated[j + 1:]
+                        if key in ("logits", "labels"):
+                            # Caption outputs are already AR-shifted. Added label padding must be ignored
+                            # by CoCaLoss, including for models with a nonzero tokenizer pad id.
+                            inputs[key] = cat_padded_sequences(values, padding_value=-100 if key == "labels" else 0)
+                        else:
+                            inputs[key] = torch.cat(values)
 
                     losses = loss(**inputs, **inputs_no_accum, output_dict=True)
                     del inputs
@@ -236,7 +204,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 "batch_time": batch_time_m.val,
                 "samples_per_second": samples_per_second,
                 "samples_per_second_per_gpu": samples_per_second_per_gpu,
-                "scale": logit_scale_scalar,
+                "logit_scale": logit_scale_scalar,
                 "lr": optimizer.param_groups[0]["lr"]
             }
             log_data.update({name:val.val for name,val in losses_m.items()})
@@ -280,8 +248,9 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         num_samples = 0
         samples_per_val = dataloader.num_samples
 
-        # FIXME this does not scale past small eval datasets
-        # all_image_features @ all_text_features will blow up memory and compute very quickly
+        # Retrieval metrics are computed in score chunks below, but feature
+        # accumulation and exact pair scoring remain O(N * D) memory and O(N^2)
+        # compute respectively.
         cumulative_loss = 0.0
         cumulative_gen_loss = 0.0
         all_image_features, all_text_features = [], []
@@ -296,8 +265,8 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                     image_features = model_out["image_features"]
                     text_features = model_out["text_features"]
                     logit_scale = model_out["logit_scale"]
-                    # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
-                    # however, system RAM is easily exceeded and compute time becomes problematic
+                    # Features are accumulated as CPU tensors to keep GPU memory
+                    # bounded; this remains O(N * D) system RAM.
                     all_image_features.append(image_features.cpu())
                     all_text_features.append(text_features.cpu())
                     logit_scale = logit_scale.mean()
@@ -311,24 +280,36 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                         F.cross_entropy(logits_per_text, labels)
                     ) / 2
 
-                    gen_loss = maybe_compute_generative_loss(model_out, texts=texts)
+                    gen_loss = maybe_compute_generative_loss(
+                        model_out, texts=texts, pad_id=getattr(unwrap_model(model), 'pad_id', 0))
 
                 cumulative_loss += total_loss * batch_size
                 num_samples += batch_size
+                if gen_loss is not None:
+                    cumulative_gen_loss += gen_loss * batch_size
                 if is_master(args) and (i % 100) == 0:
                     logging.info(
                         f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
                         f"Clip Loss: {cumulative_loss / num_samples:.6f}\t")
 
                     if gen_loss is not None:
-                        cumulative_gen_loss += gen_loss * batch_size
                         logging.info(
                             f"Generative Loss: {cumulative_gen_loss / num_samples:.6f}\t")
 
+            retrieval_chunk_size = getattr(
+                args,
+                "val_retrieval_chunk_size",
+                DEFAULT_RETRIEVAL_CHUNK_SIZE,
+            )
+            retrieval_precision = getattr(args, "val_retrieval_precision", "fp32")
+            retrieval_device = device if retrieval_chunk_size and retrieval_chunk_size > 0 else None
             val_metrics = get_clip_metrics(
-                image_features=torch.cat(all_image_features),
-                text_features=torch.cat(all_text_features),
+                image_features=all_image_features,
+                text_features=all_text_features,
                 logit_scale=logit_scale.cpu(),
+                retrieval_chunk_size=retrieval_chunk_size,
+                retrieval_device=retrieval_device,
+                retrieval_dtype="model" if retrieval_precision == "model" else torch.float32,
             )
             loss = cumulative_loss / num_samples
             metrics.update(
@@ -341,62 +322,12 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
     if not metrics:
         return metrics
 
-    logging.info(
-        f"Eval Epoch: {epoch} "
-        + "\t".join([f"{k}: {round(v, 4):.4f}" for k, v in metrics.items()])
-    )
-
-    log_data = {"val/" + name: val for name, val in metrics.items()}
-
-    if args.save_logs:
-        if tb_writer is not None:
-            for name, val in log_data.items():
-                tb_writer.add_scalar(name, val, epoch)
-
-        with open(os.path.join(args.checkpoint_path, "results.jsonl"), "a+") as f:
-            f.write(json.dumps(metrics))
-            f.write("\n")
-
     if args.wandb:
-        assert wandb is not None, 'Please install wandb.'
-        if 'train' in data:
-            dataloader = data['train'].dataloader
-            num_batches_per_epoch = dataloader.num_batches // args.accum_freq
-            step = num_batches_per_epoch * epoch
-        else:
-            step = None
-        log_data['epoch'] = epoch
-        wandb.log(log_data, step=step)
+        assert wandb is not None, "Please install wandb."
+    eval_utils.log_eval_metrics(metrics, data, epoch, args, logging, tb_writer, wandb if args.wandb else None)
 
     return metrics
-
-
-def get_clip_metrics(image_features, text_features, logit_scale):
-    metrics = {}
-    logits_per_image = (logit_scale * image_features @ text_features.t()).detach().cpu()
-    logits_per_text = logits_per_image.t().detach().cpu()
-
-    logits = {"image_to_text": logits_per_image, "text_to_image": logits_per_text}
-    ground_truth = torch.arange(len(text_features)).view(-1, 1)
-
-    for name, logit in logits.items():
-        ranking = torch.argsort(logit, descending=True)
-        preds = torch.where(ranking == ground_truth)[1]
-        preds = preds.detach().cpu().numpy()
-        metrics[f"{name}_mean_rank"] = preds.mean() + 1
-        metrics[f"{name}_median_rank"] = np.floor(np.median(preds)) + 1
-        for k in [1, 5, 10]:
-            metrics[f"{name}_R@{k}"] = np.mean(preds < k)
-
-    return metrics
-
 
 def maybe_compute_generative_loss(model_out, texts=None, pad_id=0):
-    # CoCa is the only model that emits "logits" in its output dict. The model
-    # itself no longer applies the autoregressive shift (that moved into
-    # CoCaTask for the task-based pipeline), so we apply it here for the eval
-    # generative-loss readout.
-    if "logits" in model_out and texts is not None:
-        logits = model_out["logits"][:, :-1]
-        labels = texts[:, 1:]
-        return F.cross_entropy(logits.permute(0, 2, 1), labels, ignore_index=pad_id)
+    # Preserve the legacy third positional argument (the current trainer also accepts text_valid).
+    return eval_utils.maybe_compute_generative_loss(model_out, texts=texts, pad_id=pad_id)

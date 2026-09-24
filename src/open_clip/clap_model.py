@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .model_traits import CLAP_TRAITS
 from .audio.config import CLIPAudioCfg
 from .model import CLIPTextCfg, _build_text_tower
 
@@ -22,6 +23,7 @@ def _build_audio_tower(
 class CLAP(nn.Module):
     """Contrastive Language-Audio Pretraining model."""
 
+    traits = CLAP_TRAITS  # audio_input / requires_naflex_data resolved per tower by the factory
     output_dict: torch.jit.Final[bool]
 
     def __init__(
@@ -38,6 +40,7 @@ class CLAP(nn.Module):
     ):
         super().__init__()
         self.output_dict = output_dict
+        self.embed_dim = embed_dim
         self.audio = _build_audio_tower(embed_dim, audio_cfg)
         self.text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
         self.context_length = self.text.context_length
@@ -51,8 +54,8 @@ class CLAP(nn.Module):
         else:
             self.logit_bias = None
 
-    def lock_text_tower(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True):
-        self.text.lock(unlocked_layers, freeze_layer_norm)
+    def lock_text_tower(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True, pooler_in_head: bool = True):
+        self.text.lock(unlocked_layers, freeze_layer_norm, pooler_in_head)
 
     def set_grad_checkpointing(self, enable: bool = True, impl: str = 'inline'):
         self.audio.set_grad_checkpointing(enable, impl=impl)

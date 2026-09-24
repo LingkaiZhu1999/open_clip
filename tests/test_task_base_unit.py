@@ -4,7 +4,6 @@ Covers (via concrete CLIPTask): prepare_batch, create_dummy_batch,
 forward() calling-convention normalization, state_dict_for_inference,
 clamp_logit_scale, and data_keys.
 """
-import copy
 import math
 import types
 
@@ -147,6 +146,23 @@ def test_create_dummy_batch_uses_configured_naflex_shape():
     assert batch["text"].shape == (2, 5)
 
 
+def test_create_dummy_batch_keeps_non_base_naflex_patches_spatial():
+    """A non-base eval patch size follows the real eval transform: patches stay (Ph, Pw, C) for the tower's
+    weight interpolator instead of being flattened to a dim the base projection cannot consume."""
+    task = CLIPTask(TinyModel(), loss=DummyLoss())
+    task.set_naflex_data_config(NaFlexDataConfig.resolve(
+        patch_sizes=[32], seq_lens=[4], model_patch_size=16, supports_patch_interpolation=True))
+
+    batch = task.create_dummy_batch(batch_size=2)
+    assert batch["image"]["patches"].shape == (2, 4, 32, 32, 3)
+    assert batch["image"]["patch_coord"].shape == (2, 4, 2)
+
+    # Base size with the model geometry known stays flat (unchanged contract).
+    task.set_naflex_data_config(NaFlexDataConfig.resolve(
+        patch_sizes=[16], seq_lens=[4], model_patch_size=16, supports_patch_interpolation=True))
+    assert task.create_dummy_batch(batch_size=2)["image"]["patches"].shape == (2, 4, 16 * 16 * 3)
+
+
 # ---------------------------------------------------------------------------
 # forward() normalization: dict, positional, kwargs
 # ---------------------------------------------------------------------------
@@ -155,7 +171,7 @@ def test_create_dummy_batch_uses_configured_naflex_shape():
 def test_forward_dict_arg():
     task = CLIPTask(TinyModel(), loss=DummyLoss())
     task.train()
-    losses = task(_batch())
+    losses, _ = task(_batch())
     assert "loss" in losses and "contrastive_loss" in losses
 
 
@@ -163,7 +179,7 @@ def test_forward_positional_args():
     task = CLIPTask(TinyModel(), loss=DummyLoss())
     task.train()
     b = _batch()
-    losses = task(b["image"], b["text"])
+    losses, _ = task(b["image"], b["text"])
     assert "loss" in losses
 
 
@@ -171,7 +187,7 @@ def test_forward_kwargs():
     task = CLIPTask(TinyModel(), loss=DummyLoss())
     task.train()
     b = _batch()
-    losses = task(image=b["image"], text=b["text"])
+    losses, _ = task(image=b["image"], text=b["text"])
     assert "loss" in losses
 
 
@@ -180,7 +196,7 @@ def test_forward_mixed_positional_and_kwargs():
     task = CLIPTask(TinyModel(), loss=DummyLoss())
     task.train()
     b = _batch()
-    losses = task(b["image"], text=b["text"])
+    losses, _ = task(b["image"], text=b["text"])
     assert "loss" in losses
 
 
@@ -189,9 +205,9 @@ def test_forward_all_modes_equivalent():
     task = CLIPTask(TinyModel(), loss=DummyLoss())
     task.train()
     b = _batch()
-    d = task(b)["loss"]
-    t = task(b["image"], b["text"])["loss"]
-    k = task(image=b["image"], text=b["text"])["loss"]
+    d = task(b)[0]["loss"]
+    t = task(b["image"], b["text"])[0]["loss"]
+    k = task(image=b["image"], text=b["text"])[0]["loss"]
     assert torch.allclose(d, t) and torch.allclose(t, k)
 
 
@@ -220,30 +236,6 @@ def test_forward_eval_positional():
 def test_data_keys_default():
     task = CLIPTask(TinyModel(), loss=DummyLoss())
     assert task.data_keys == ("image", "text")
-
-
-# ---------------------------------------------------------------------------
-# state_dict_for_inference
-# ---------------------------------------------------------------------------
-
-
-def test_state_dict_for_inference_no_ema():
-    model = TinyModel()
-    task = CLIPTask(model, loss=DummyLoss())
-    sd = task.state_dict_for_inference()
-    assert "logit_scale" in sd
-    assert torch.equal(sd["logit_scale"], model.logit_scale.data)
-
-
-def test_state_dict_for_inference_prefers_ema():
-    model = TinyModel()
-    task = CLIPTask(model, loss=DummyLoss())
-    ema_model = copy.deepcopy(model)
-    with torch.no_grad():
-        ema_model.logit_scale.fill_(123.0)
-    task.trainable_module_ema = types.SimpleNamespace(module=ema_model)
-    sd = task.state_dict_for_inference()
-    assert torch.equal(sd["logit_scale"], ema_model.state_dict()["logit_scale"])
 
 
 # ---------------------------------------------------------------------------

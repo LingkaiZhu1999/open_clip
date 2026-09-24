@@ -1,10 +1,11 @@
 import math
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from .base_task import TrainingTask, unwrap_model
+from open_clip.audio.transform import create_dummy_audio
 
 
 class CLAPTask(TrainingTask):
@@ -53,15 +54,18 @@ class CLAPTask(TrainingTask):
             inputs["logit_bias"] = model_out["logit_bias"]
         return inputs
 
-    def training_forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        model_out = self.trainable_module(**batch)
+    def training_forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[Dict, Dict]:
+        model_out = self.trainable_module(audio=batch["audio"], text=batch["text"])
         loss_inputs = self._loss_inputs(model_out)
-        logit_scale = loss_inputs["logit_scale"]
         losses = self.loss(**loss_inputs, output_dict=True)
         total_loss = sum(v for k, v in losses.items() if k.endswith("_loss"))
         losses["loss"] = total_loss
-        losses["logit_scale"] = logit_scale
-        return losses
+        # Report from raw model_out (the source of truth for logit_scale/logit_bias) — uniform with clip/coca.
+        return losses, self._report(model_out)
+
+    def eval_forward(self, batch: Dict[str, torch.Tensor]):
+        inputs = {key: batch[key] for key in self.data_keys if key in batch}
+        return self.get_trainable_module(use_ema=True)(**inputs)
 
     def compute_accum_loss(self, inputs, inputs_no_accum, accum_batches):
         loss_inputs = {
@@ -69,7 +73,8 @@ class CLAPTask(TrainingTask):
             "text_features": inputs["text_features"],
             **inputs_no_accum,
         }
-        return self.loss(**loss_inputs, output_dict=True)
+        losses = self.loss(**loss_inputs, output_dict=True)
+        return losses, self._report(inputs_no_accum)
 
     def create_dummy_batch(
             self,
@@ -78,25 +83,8 @@ class CLAPTask(TrainingTask):
             dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         model = unwrap_model(self.trainable_module)
-        audio_cfg = model.audio.cfg
-        dummy_audio = {
-            "waveform": torch.zeros(batch_size, audio_cfg.clip_samples, device=device, dtype=dtype),
-            "longer": torch.zeros(batch_size, dtype=torch.bool, device=device),
-        }
-        if audio_cfg.enable_fusion:
-            from open_clip.audio.transform import get_audio_frame_count
-
-            audio_frames = get_audio_frame_count(audio_cfg)
-            dummy_audio["mel_fusion"] = torch.zeros(
-                batch_size,
-                4,
-                audio_frames,
-                audio_cfg.mel_bins,
-                device=device,
-                dtype=dtype,
-            )
         return {
-            "audio": dummy_audio,
+            "audio": create_dummy_audio(model.audio.cfg, batch_size=batch_size, device=device, dtype=dtype),
             "text": torch.zeros(batch_size, model.context_length, dtype=torch.long, device=device),
         }
 
@@ -107,4 +95,13 @@ class CLAPTask(TrainingTask):
                 model.logit_scale.clamp_(0, max_val)
 
     def ddp_extra_kwargs(self):
-        return {"find_unused_parameters": True}
+        # HTSAT feature-fusion towers exercise their fusion modules only for batches containing 'longer' clips,
+        # so those params receive no grads on all-short batches and DDP must search for unused parameters.
+        # Static audio towers (no fusion, NaFlexClap) skip the search -- it costs an extra graph traversal
+        # every step (and PyTorch warns when nothing unused is found). Fusion is declared on the audio tower
+        # cfg; the module-attribute scan is a fallback for towers built without a cfg (HTSAT sets both).
+        model = unwrap_model(self.trainable_module)
+        audio_cfg = getattr(getattr(model, "audio", None), "cfg", None)
+        fusion = bool(getattr(audio_cfg, "enable_fusion", False))
+        fusion = fusion or any(getattr(m, "enable_fusion", False) for m in model.modules())
+        return {"find_unused_parameters": True} if fusion else {}

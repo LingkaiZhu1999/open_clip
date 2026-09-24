@@ -6,19 +6,13 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from open_clip.model_traits import unwrap_model
+from open_clip.utils import move_to_device
+
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed._composable.fsdp import MixedPrecisionPolicy, CPUOffloadPolicy
-
-
-def unwrap_model(model: nn.Module) -> nn.Module:
-    """Unwrap model from DDP and/or torch.compile wrappers."""
-    unwrapped = model
-    if hasattr(unwrapped, 'module'):
-        unwrapped = unwrapped.module
-    if hasattr(unwrapped, '_orig_mod'):
-        unwrapped = unwrapped._orig_mod
-    return unwrapped
+    from open_clip.naflex_config import NaFlexDataConfig
 
 
 def get_model_from_task(task_or_model: nn.Module) -> nn.Module:
@@ -69,6 +63,25 @@ class TrainingTask(nn.Module):
         self.normalize_checkpoint_scalars = True
         self._compiled_training_forward = None
         self._compiled_eval_forward = None
+        # Optional NaFlex data policy (image OR audio); shared with data loaders and dummy batches. NaFlex is a
+        # cross-modal data concern, so it lives on the modality-agnostic base, not just the image-text layer.
+        self._naflex_data_config = None
+
+    @property
+    def naflex_data_config(self) -> Optional["NaFlexDataConfig"]:
+        return self._naflex_data_config
+
+    @property
+    def naflex_eval_config(self) -> Optional[Tuple[Tuple[int, int], int]]:
+        return self._naflex_data_config.eval_config if self._naflex_data_config is not None else None
+
+    def set_naflex_data_config(
+            self,
+            naflex_data_config: Optional["NaFlexDataConfig"],
+    ) -> "TrainingTask":
+        """Configure the NaFlex train/eval data policy (image or audio); shared by loaders and dummy batches."""
+        self._naflex_data_config = naflex_data_config
+        return self
 
     @staticmethod
     def _compile_kwargs(
@@ -103,6 +116,21 @@ class TrainingTask(nn.Module):
         kwargs = self._compile_kwargs(backend=backend, mode=mode, **compile_kwargs)
         if target == 'model':
             self.trainable_module = torch.compile(self.trainable_module, **kwargs)
+        elif target == 'blocks':
+            # Compile transformer blocks in place; surrounding code (incl. any inline
+            # torch.utils.checkpoint call in the trunks) stays eager. Grad-checkpoint recompute
+            # is then sequenced block-by-block by eager autograd instead of being traced into
+            # the compiled backward, which bounds backward working-set to ~one block. Use when
+            # whole-graph compile schedules checkpointed recomputes poorly (torch 2.13 regression).
+            blocks = self._get_fsdp_shard_modules()
+            if not blocks:
+                raise ValueError("compile target 'blocks' found no blocks to compile "
+                                 "(see _get_fsdp_shard_modules)")
+            model = unwrap_model(self.trainable_module)
+            for name, mod in blocks:
+                parent_name, _, attr = name.rpartition('.')
+                parent = model.get_submodule(parent_name) if parent_name else model
+                setattr(parent, attr, torch.compile(mod, **kwargs))
         elif target == 'task':
             if compile_train:
                 self._compiled_training_forward = torch.compile(self.training_forward, **kwargs)
@@ -123,18 +151,7 @@ class TrainingTask(nn.Module):
         Float tensors get ``input_dtype``; integer tensors stay as-is. Recurses
         into nested dicts (e.g. NaFlex patch dicts under ``"image"``).
         """
-        prepared = {}
-        for key, val in batch.items():
-            if isinstance(val, torch.Tensor):
-                if val.is_floating_point():
-                    prepared[key] = val.to(device=device, dtype=input_dtype, non_blocking=True)
-                else:
-                    prepared[key] = val.to(device=device, non_blocking=True)
-            elif isinstance(val, dict):
-                prepared[key] = self.prepare_batch(val, device, input_dtype)
-            else:
-                prepared[key] = val
-        return prepared
+        return move_to_device(batch, device, input_dtype)
 
     def get_trainable_module(self, use_ema: bool = True) -> nn.Module:
         """Get the trainable module, optionally returning EMA version."""
@@ -215,17 +232,25 @@ class TrainingTask(nn.Module):
         """Discover modules to shard with FSDP2.
 
         Default: finds all ResidualAttentionBlock, CustomResidualAttentionBlock,
-        and Bottleneck instances within the trainable module. Models can override
-        this by defining a ``fsdp_shard_modules()`` method.
+        ModernTextBlock, Bottleneck, and timm ViT ``Block`` (timm towers, incl. NaFlexVit
+        trunks) instances within the trainable module. Also drives the 'blocks' compile
+        strategy, so timm vision trunks get per-block compile rather than staying eager.
+        Models can override this by defining a ``fsdp_shard_modules()`` method.
         """
         model = unwrap_model(self.trainable_module)
         if hasattr(model, 'fsdp_shard_modules'):
             return model.fsdp_shard_modules()
 
-        from open_clip.transformer import ResidualAttentionBlock, CustomResidualAttentionBlock
+        from open_clip.transformer import ResidualAttentionBlock, CustomResidualAttentionBlock, ModernTextBlock
         from open_clip.modified_resnet import Bottleneck
 
-        shard_types = (ResidualAttentionBlock, CustomResidualAttentionBlock, Bottleneck)
+        shard_types = [ResidualAttentionBlock, CustomResidualAttentionBlock, ModernTextBlock, Bottleneck]
+        try:
+            from timm.models.vision_transformer import Block as TimmViTBlock
+            shard_types.append(TimmViTBlock)
+        except ImportError:
+            pass
+        shard_types = tuple(shard_types)
 
         modules = []
         for name, mod in model.named_modules():
@@ -332,8 +357,11 @@ class TrainingTask(nn.Module):
         # the same all-gather/reshard hooks as __call__. Without this, direct calls
         # like build_zero_shot_classifier → model.encode_text() fail with DTensor errors.
         from torch.distributed.fsdp import register_fsdp_forward_method
-        register_fsdp_forward_method(self.trainable_module, "encode_text")
-        register_fsdp_forward_method(self.trainable_module, "encode_image")
+        # Only register methods the model actually defines (e.g. GenLIP has encode_image but no encode_text).
+        unwrapped = unwrap_model(self.trainable_module)
+        for method_name in ("encode_text", "encode_image"):
+            if hasattr(unwrapped, method_name):
+                register_fsdp_forward_method(self.trainable_module, method_name)
 
         self._fsdp_enabled = True
         return self
@@ -351,6 +379,16 @@ class TrainingTask(nn.Module):
                 sd[key] = val.squeeze(0)
         return sd
 
+    @staticmethod
+    def _strip_compiled_keys(sd: dict) -> dict:
+        """Remove ``_orig_mod.`` segments that torch.compile wrappers insert into state_dict keys.
+
+        Handles both the root prefix (compile strategy 'model') and nested per-block segments
+        (strategy 'blocks', e.g. ``text.blocks.9._orig_mod.norm1.weight``) so saved checkpoints
+        are always clean and portable across compile strategies.
+        """
+        return {k.replace('._orig_mod.', '.').removeprefix('_orig_mod.'): v for k, v in sd.items()}
+
     def state_dict(self, *args, **kwargs) -> dict:
         """Return state dict with both main and EMA weights."""
         if self._fsdp_enabled:
@@ -366,11 +404,13 @@ class TrainingTask(nn.Module):
             )
             if self.normalize_checkpoint_scalars:
                 model_sd = self._normalize_scalar_params(model_sd)
-            sd = {'state_dict': model_sd}
+            sd = {'state_dict': self._strip_compiled_keys(model_sd)}
         else:
-            sd = {'state_dict': unwrap_model(self.trainable_module).state_dict()}
+            sd = {'state_dict': self._strip_compiled_keys(
+                unwrap_model(self.trainable_module).state_dict())}
         if self.trainable_module_ema is not None:
-            sd['state_dict_ema'] = self.trainable_module_ema.module.state_dict()
+            sd['state_dict_ema'] = self._strip_compiled_keys(
+                self.trainable_module_ema.module.state_dict())
         return sd
 
     @staticmethod
@@ -398,7 +438,17 @@ class TrainingTask(nn.Module):
         """Load state dict for both main and EMA weights."""
         if 'state_dict' in state_dict:
             model = unwrap_model(self.trainable_module)
-            sd = self._reconcile_state_dict_shapes(model, state_dict['state_dict'])
+            # normalize away compile-wrapper segments from the incoming checkpoint, then remap
+            # clean names onto the live model's keys when its blocks are compiled in place
+            sd = self._strip_compiled_keys(state_dict['state_dict'])
+            model_keys = list(model.state_dict().keys())
+            if any('_orig_mod' in k for k in model_keys):
+                clean_to_model = {
+                    k.replace('._orig_mod.', '.').removeprefix('_orig_mod.'): k for k in model_keys
+                }
+                # unmapped (unexpected) keys keep their name so strict-mode reporting is unchanged
+                sd = {clean_to_model.get(k, k): v for k, v in sd.items()}
+            sd = self._reconcile_state_dict_shapes(model, sd)
             if self._fsdp_enabled:
                 from torch.distributed.checkpoint.state_dict import (
                     set_model_state_dict,
@@ -410,7 +460,7 @@ class TrainingTask(nn.Module):
                 model.load_state_dict(sd, strict=strict)
         if 'state_dict_ema' in state_dict and self.trainable_module_ema is not None:
             self.trainable_module_ema.module.load_state_dict(
-                state_dict['state_dict_ema'], strict=strict,
+                self._strip_compiled_keys(state_dict['state_dict_ema']), strict=strict,
             )
 
     def state_dict_for_inference(self) -> dict:
@@ -431,13 +481,30 @@ class TrainingTask(nn.Module):
             return sd
         return unwrap_model(self.trainable_module).state_dict()
 
+    @staticmethod
+    def _report(source: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Per-step scalars to LOG (not loss terms): ``logit_scale``, and ``logit_bias`` when present.
+
+        Returned as the second element of ``training_forward``/``compute_accum_loss``'s ``(losses, report)`` so the
+        train loop logs them once, instead of smuggling them through the loss dict (where the generic loss meter
+        would double-log the scale).
+        """
+        return {key: source[key] for key in ("logit_scale", "logit_bias") if key in source}
+
+    def concat_accum_features(self, features: Dict[str, List[torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Combine cached and live microbatch outputs; override for outputs with variable sequence lengths."""
+        return {key: torch.cat(values) for key, values in features.items()}
+
     def compute_accum_loss(self, inputs, inputs_no_accum, accum_batches):
         """Compute loss from accumulated features for gradient accumulation.
 
         Override in subclasses that need to derive training targets from
         raw batch dicts (e.g. autoregressive label creation in CoCa).
+
+        Returns ``(losses, report)`` — see :meth:`_report`.
         """
-        return self.loss(**inputs, **inputs_no_accum, output_dict=True)
+        losses = self.loss(**inputs, **inputs_no_accum, output_dict=True)
+        return losses, self._report(inputs_no_accum)
 
     def eval_forward(self, batch: Dict[str, torch.Tensor]):
         return self.get_trainable_module(use_ema=True)(**batch)
@@ -462,5 +529,6 @@ class TrainingTask(nn.Module):
             forward_fn = self._compiled_training_forward or self.training_forward
         return forward_fn(batch)
 
-    def training_forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def training_forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[Dict, Dict]:
+        """Run the train-time forward. Subclasses return ``(losses, report)`` — see :meth:`_report`."""
         raise NotImplementedError

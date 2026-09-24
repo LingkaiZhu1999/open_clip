@@ -5,7 +5,33 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import nn as nn
 from torch import _assert
+from torch.nn import functional as F
 from torchvision.ops.misc import FrozenBatchNorm2d
+
+
+def move_to_device(value, device, input_dtype=None):
+    """Move tensors in nested dictionaries, casting only floating-point tensors."""
+    if isinstance(value, torch.Tensor):
+        if value.is_floating_point():
+            return value.to(device=device, dtype=input_dtype, non_blocking=True)
+        return value.to(device=device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: move_to_device(val, device, input_dtype) for key, val in value.items()}
+    return value
+
+
+def cat_padded_sequences(tensors: List[torch.Tensor], padding_value: float = 0) -> torch.Tensor:
+    """Concatenate ``[batch, length, ...]`` tensors, right-padding length to the maximum.
+
+    Used when accumulating caption logits/labels from microbatches with different text lengths.
+    Padding stays outside the model forward and preserves gradients through the live microbatch.
+    """
+    max_length = max(t.shape[1] for t in tensors)
+    return torch.cat([
+        F.pad(t, (0, 0) * (t.ndim - 2) + (0, max_length - t.shape[1]), value=padding_value)
+        if t.shape[1] != max_length else t
+        for t in tensors
+    ])
 
 
 def freeze_batch_norm_2d(module, module_match={}, name=''):
@@ -79,16 +105,33 @@ def replace_linear(model, linear_replacement, include_modules=['c_fc', 'c_proj']
             if copy_weights:
                 model._modules[name].weight.data.copy_(old_module.weight.data)
                 if model._modules[name].bias is not None:
-                    model._modules[name].bias.data.copy_(old_module.bias)
+                    # assign (not .data.copy_) so the bias adopts old_module's dtype rather than
+                    # keeping linear_replacement's own default (float32) bias dtype -- a stale fp32
+                    # bias silently upcasts this layer's output and corrupts dtype for everything
+                    # downstream (e.g. the next LayerNorm, whose own weight/bias stay fp16).
+                    model._modules[name].bias.data = old_module.bias.data.clone()
 
     return model
 
-def convert_int8_model_to_inference_mode(model):
+def convert_int8_model_to_inference_mode(model, dtype: Optional[torch.dtype] = None):
     for m in model.modules():
         if hasattr(m, 'prepare_for_eval'):
-            int8_original_dtype = m.weight.dtype
+            # triton-based bnb layers (e.g. SwitchBackLinear): quantize the float weight and
+            # discard the shadow copy. int8_original_dtype tells get_weight_dtype() what dtype
+            # to cast activations to, since weight.dtype now reports torch.int8.
+            int8_original_dtype = dtype if dtype is not None else m.weight.dtype
             m.prepare_for_eval()
             m.int8_original_dtype = int8_original_dtype
+        elif getattr(getattr(m, 'weight', None), 'dtype', None) == torch.int8:
+            # e.g. bnb.nn.Linear8bitLt: weight quantizes itself as soon as it's moved to a CUDA
+            # device (no separate prepare_for_eval step), so it needs the same stamp applied here.
+            # bias, if present, is never quantized and still reflects the pre-quantization dtype.
+            if dtype is not None:
+                m.int8_original_dtype = dtype
+            elif getattr(m, 'bias', None) is not None:
+                m.int8_original_dtype = m.bias.dtype
+            else:
+                m.int8_original_dtype = torch.float16
 
 
 def feature_take_indices(

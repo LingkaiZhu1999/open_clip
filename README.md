@@ -10,13 +10,13 @@ tags:
 
 # ViT-B-32 OpenCLIP Model on LAION-400M
 
-This is a ViT-B-32 model trained using [OpenCLIP](https://github.com/mlfoundations/open_clip) on the LAION-400M dataset. 
+This is a ViT-B-32 model trained using [OpenCLIP](https://github.com/mlfoundations/open_clip) on the LAION-400M dataset.
 
 ## Training Details
 
 The model was trained with the following configuration:
 - **Model Architecture**: ViT-B-32
-- **Dataset**: LAION-400M 
+- **Dataset**: LAION-400M
 - **Number of Samples**: 400M (~ 268,836,185 filtered samples used)
 - **Hardware**: 2 Nodes, each with 4 H200 141GB GPUs (Total 8 GPUs)
 - **Batch Size (per GPU)**: 4096
@@ -57,3 +57,8 @@ with torch.no_grad(), torch.cuda.amp.autocast():
 
 print("Label probs:", text_probs)
 ```
+
+
+## Upstream OpenCLIP documentation
+
+See [README.upstream.md](README.upstream.md) for the upstream project overview, installation, model catalog, and training documentation.

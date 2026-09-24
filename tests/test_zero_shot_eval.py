@@ -4,12 +4,16 @@ import pytest
 import torch
 
 from open_clip_train import zero_shot as zero_shot_module
+from open_clip_train.eval_utils import accuracy
 
 
 class _BareModel:
     visual = object()
 
     def encode_image(self, image, normalize=False):
+        raise NotImplementedError
+
+    def encode_text(self, text, normalize=False):
         raise NotImplementedError
 
 
@@ -30,7 +34,7 @@ def test_accuracy_returns_python_scalars():
     ])
     target = torch.tensor([1, 2])
 
-    acc1, acc2 = zero_shot_module.accuracy(logits, target, topk=(1, 2))
+    acc1, acc2 = accuracy(logits, target, topk=(1, 2))
 
     assert acc1 == 1.0
     assert acc2 == 2.0
@@ -134,6 +138,33 @@ def test_zero_shot_eval_unwraps_wrapped_model_once(monkeypatch):
     assert run_models == [wrapped_model]  # run_zero_shot_classifier gets model_or_task
 
 
+def test_zero_shot_eval_skips_generative_model_without_text_tower():
+    """A generative VLM (image tower, but no encode_text) skips the contrastive zero-shot path."""
+    class _GenerativeModel:
+        visual = object()
+
+        def encode_image(self, image, normalize=False):
+            raise NotImplementedError
+        # no encode_text -> no contrastive text tower (e.g. GenLIP)
+
+    args = SimpleNamespace(
+        distributed=False,
+        zeroshot_frequency=1,
+        epochs=1,
+        model="naflexgenlip_b16",
+        device="cpu",
+        precision="fp32",
+        batch_size=1,
+        rank=0,
+        fsdp=False,
+    )
+    data = {"imagenet-val": _DataWrapper()}
+
+    results = zero_shot_module.zero_shot_eval(_GenerativeModel(), data, epoch=1, args=args)
+
+    assert results == {}
+
+
 def test_zero_shot_eval_rejects_non_image_model():
     class _AudioModel:
         audio = object()
@@ -164,7 +195,7 @@ def test_accuracy_returns_python_floats():
     )
     target = torch.tensor([0, 1])
 
-    top1, top2 = zero_shot_module.accuracy(output, target, topk=(1, 2))
+    top1, top2 = accuracy(output, target, topk=(1, 2))
 
     assert isinstance(top1, float)
     assert isinstance(top2, float)
@@ -222,7 +253,7 @@ def test_run_zero_shot_classifier_uses_task_dummy_batch_for_fsdp_non_rank0(monke
         def __call__(self, image):
             raise AssertionError("rank 1 should stop before forward when broadcast signal is zero")
 
-    monkeypatch.setattr(zero_shot_module.dist, "broadcast", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda *_args, **_kwargs: None)
     args = SimpleNamespace(
         device="cpu",
         precision="fp32",
@@ -242,3 +273,46 @@ def test_run_zero_shot_classifier_uses_task_dummy_batch_for_fsdp_non_rank0(monke
 
     assert (top1, top5) == (0., 0.)
     assert calls == [(1, torch.device("cpu"), None)]
+
+
+@pytest.mark.parametrize("modality", ["image", "audio"])
+@pytest.mark.parametrize("output_dict", [False, True])
+def test_classifier_fsdp_ranks_match_local_execution(modality, output_dict, monkeypatch):
+    from open_clip_train.audio_zero_shot import run_audio_zero_shot_classifier
+
+    class Model:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def create_dummy_batch(self, batch_size, device, dtype):
+            value = torch.ones(batch_size, 3, device=device, dtype=dtype)
+            return {modality: {"waveform": value} if modality == "audio" else value}
+
+        def __call__(self, **inputs):
+            value = inputs[modality]
+            features = value["waveform"] if modality == "audio" else value
+            self.batch_sizes.append(len(features))
+            return {f"{modality}_features": features} if output_dict else (features,)
+
+    runner = zero_shot_module.run_zero_shot_classifier if modality == "image" else run_audio_zero_shot_classifier
+    batches = []
+    for n in (2, 3):
+        features, targets = torch.eye(3)[:n], torch.arange(n)
+        batches.append((features, targets) if modality == "image" else
+                       {"audio": {"waveform": features}, "target": targets})
+    args = SimpleNamespace(device="cpu", precision="fp32", rank=0, fsdp=True, batch_size=2)
+    expected = runner(Model(), torch.eye(3), batches, args)
+    signals = []
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda signal, src: signals.append(signal.item()))
+    model = Model()
+    assert runner(model, torch.eye(3), batches, args, use_fsdp_eval=True) == expected == (1., 1.)
+    assert model.batch_sizes == [2, 3]
+    assert signals == [1, 1, 0]
+
+    pending = iter(signals)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda signal, src: signal.fill_(next(pending)))
+    args.rank = 1
+    model = Model()
+    assert runner(model, torch.eye(3), None, args, use_fsdp_eval=True) == (0., 0.)
+    assert model.batch_sizes == [1, 1]
+    assert next(pending, None) is None

@@ -18,11 +18,14 @@ class NaFlexDataConfig:
     train_patch_sizes: Tuple[Tuple[int, int], ...] = ((16, 16),)
     train_patch_size_probs: Optional[Tuple[float, ...]] = None
     train_seq_lens: Tuple[int, ...] = (128, 256, 576, 784, 1024)
+    train_seq_len_probs: Optional[Tuple[float, ...]] = None
     train_num_image_tokens: Optional[int] = None
-    max_tokens_per_batch: int = 4096 * 4
+    max_tokens_per_batch: Optional[int] = None
     batch_divisor: int = 8
     eval_patch_size: Tuple[int, int] = (16, 16)
     eval_seq_len: int = 1024
+    model_patch_size: Optional[Tuple[int, int]] = None
+    supports_patch_interpolation: Optional[bool] = None
 
     @classmethod
     def resolve(
@@ -30,11 +33,14 @@ class NaFlexDataConfig:
             patch_sizes: Optional[Sequence[PatchSize]] = None,
             patch_size_probs: Optional[Sequence[float]] = None,
             seq_lens: Optional[Sequence[int]] = None,
+            seq_len_probs: Optional[Sequence[float]] = None,
             train_num_image_tokens: Optional[int] = None,
-            max_tokens_per_batch: int = 4096 * 4,
+            max_tokens_per_batch: Optional[int] = None,
             batch_divisor: int = 8,
             eval_patch_size: Optional[PatchSize] = None,
             eval_seq_len: Optional[int] = None,
+            model_patch_size: Optional[PatchSize] = None,
+            supports_patch_interpolation: Optional[bool] = None,
     ) -> 'NaFlexDataConfig':
         patch_sizes = (16,) if patch_sizes is None else patch_sizes
         train_patch_sizes = tuple(to_2tuple(size) for size in patch_sizes)
@@ -49,6 +55,19 @@ class NaFlexDataConfig:
             raise ValueError("NaFlex sequence lengths must contain at least one value.")
         if not all(seq_len > 0 for seq_len in train_seq_lens):
             raise ValueError("NaFlex sequence lengths must be positive.")
+
+        # Weights stay aligned to ``train_seq_lens`` (user order here); the scheduler pairs + sorts them with the
+        # seq-lens, so the alignment survives its ``sorted(set(...))``. Unset -> uniform sampling (legacy).
+        train_seq_len_probs = None
+        if seq_len_probs is not None:
+            if len(seq_len_probs) != len(train_seq_lens):
+                raise ValueError("NaFlex seq-len probabilities must match seq-lens length.")
+            if not all(prob >= 0 for prob in seq_len_probs):
+                raise ValueError("NaFlex seq-len probabilities must be non-negative.")
+            prob_sum = float(sum(seq_len_probs))
+            if prob_sum <= 0:
+                raise ValueError("NaFlex seq-len probabilities must sum to a positive value.")
+            train_seq_len_probs = tuple(float(prob) / prob_sum for prob in seq_len_probs)
 
         train_patch_size_probs = None
         if patch_size_probs is not None:
@@ -67,9 +86,10 @@ class NaFlexDataConfig:
         if train_num_image_tokens is not None and train_num_image_tokens <= 0:
             raise ValueError("NaFlex train image token count must be positive.")
 
-        max_tokens_per_batch = int(max_tokens_per_batch)
-        if max_tokens_per_batch <= 0:
-            raise ValueError("NaFlex max image tokens per batch must be positive.")
+        if max_tokens_per_batch is not None:
+            max_tokens_per_batch = int(max_tokens_per_batch)
+            if max_tokens_per_batch <= 0:
+                raise ValueError("NaFlex max tokens per batch must be positive.")
 
         batch_divisor = int(batch_divisor)
         if batch_divisor <= 0:
@@ -83,20 +103,67 @@ class NaFlexDataConfig:
         if eval_seq_len <= 0:
             raise ValueError("NaFlex eval sequence length must be positive.")
 
+        model_patch_size = to_2tuple(model_patch_size) if model_patch_size is not None else None
+        if model_patch_size is not None and (model_patch_size[0] <= 0 or model_patch_size[1] <= 0):
+            raise ValueError("NaFlex model patch size must be positive.")
+        if supports_patch_interpolation is not None:
+            supports_patch_interpolation = bool(supports_patch_interpolation)
+
+        configured_patch_sizes = set(train_patch_sizes)
+        configured_patch_sizes.add(eval_patch_size)
+        if (
+                model_patch_size is not None
+                and supports_patch_interpolation is False
+                and any(size != model_patch_size for size in configured_patch_sizes)
+        ):
+            non_base_sizes = sorted(size for size in configured_patch_sizes if size != model_patch_size)
+            raise ValueError(
+                f"NaFlex patch sizes {non_base_sizes} differ from the model base patch size "
+                f"{model_patch_size}, but this model does not have patch interpolation enabled/supported. "
+                "Use the base patch size, or enable patch interpolation on a timm NaFlexVit image tower "
+                "(vision_cfg.naflex_patch_interp / --force-naflex-patch-interp)."
+            )
+
         return cls(
             train_patch_sizes=train_patch_sizes,
             train_patch_size_probs=train_patch_size_probs,
             train_seq_lens=train_seq_lens,
+            train_seq_len_probs=train_seq_len_probs,
             train_num_image_tokens=train_num_image_tokens,
             max_tokens_per_batch=max_tokens_per_batch,
             batch_divisor=batch_divisor,
             eval_patch_size=eval_patch_size,
             eval_seq_len=eval_seq_len,
+            model_patch_size=model_patch_size,
+            supports_patch_interpolation=supports_patch_interpolation,
         )
 
     @property
     def variable_patch_size(self) -> bool:
         return len(self.train_patch_sizes) > 1
+
+    def should_flatten_patches(self, patch_size: PatchSize) -> bool:
+        """Keep non-base patches spatial so the model can infer ``(Ph, Pw)`` for weight interpolation.
+
+        When no model geometry was supplied, preserve the historical data-only behavior: fixed patch-size
+        configurations are flattened and multi-size configurations are not. Model-wired training always supplies
+        ``model_patch_size`` and therefore makes this decision per patch size instead of from the number of choices.
+        """
+        if self.model_patch_size is None:
+            return not self.variable_patch_size
+        return to_2tuple(patch_size) == self.model_patch_size
+
+    def resolve_max_tokens_per_batch(self, batch_size: int, per_row_text_tokens: int = 0) -> int:
+        """Return the explicit budget or infer one at the longest configured sequence length."""
+        if self.max_tokens_per_batch is not None:
+            return self.max_tokens_per_batch
+        batch_size = int(batch_size)
+        per_row_text_tokens = int(per_row_text_tokens)
+        if batch_size <= 0:
+            raise ValueError("NaFlex batch size must be positive when inferring the token budget.")
+        if per_row_text_tokens < 0:
+            raise ValueError("NaFlex per-row text token cost must be non-negative.")
+        return batch_size * (max(self.train_seq_lens) + per_row_text_tokens)
 
     @property
     def eval_config(self) -> Tuple[Tuple[int, int], int]:

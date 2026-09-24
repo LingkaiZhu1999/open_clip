@@ -18,4 +18,4 @@ clip/bin/python -m open_clip_train.main \
     --precision pure_bf16 \
     --model RN50 \
     --val-frequency 5 \
-    --zeroshot-frequency 5 
+    --zeroshot-frequency 5

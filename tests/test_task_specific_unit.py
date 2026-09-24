@@ -85,19 +85,19 @@ def test_clip_task_loss_aggregation():
     """total loss sums only keys ending in '_loss', not 'debug_metric'."""
     task = CLIPTask(TinyModel(), loss=DummyClipLoss())
     task.train()
-    losses = task(_batch())
+    losses, report = task(_batch())
     # contrastive_loss=1.0, debug_metric should NOT be summed
     assert abs(losses["loss"].item() - 1.0) < 1e-6
-    assert "logit_scale" in losses
+    assert "logit_scale" in report
 
 
-def test_clip_task_logit_scale_in_output():
-    """logit_scale is included in the loss dict for logging."""
+def test_clip_task_logit_scale_in_report():
+    """logit_scale is returned in the report dict for logging, NOT the loss dict."""
     task = CLIPTask(TinyModel(), loss=DummyClipLoss())
     task.train()
-    losses = task(_batch())
-    assert "logit_scale" in losses
-    assert losses["logit_scale"].item() == 10.0
+    losses, report = task(_batch())
+    assert "logit_scale" not in losses
+    assert report["logit_scale"].item() == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ def test_clip_task_logit_scale_in_output():
 
 
 def test_coca_build_loss_inputs_autoregressive_shift():
-    """_build_loss_inputs applies the correct autoregressive shift."""
+    """_build_loss_inputs applies the correct autoregressive shift and -100 label masking."""
     model = TinyModel(has_logits=True)
     task = CoCaTask(model, loss=DummyCoCaLoss())
     b = _batch(bs=2, seq=5)
@@ -115,14 +115,25 @@ def test_coca_build_loss_inputs_autoregressive_shift():
     # logits shifted: [:, :-1], labels shifted: text[:, 1:]
     assert loss_input["logits"].shape[1] == b["text"].shape[1] - 1
     assert loss_input["labels"].shape[1] == b["text"].shape[1] - 1
-    assert torch.equal(loss_input["labels"], b["text"][:, 1:])
+    # without a text_valid mask, validity falls back to text != pad_id (0): shifted labels match
+    # the text at valid positions and are -100 at fallback-pad positions
+    shifted = b["text"][:, 1:]
+    expected = shifted.masked_fill(shifted == 0, -100)
+    assert torch.equal(loss_input["labels"], expected)
+    # with an explicit text_valid mask, validity follows the mask (value collisions ignored)
+    mask = torch.ones_like(b["text"], dtype=torch.bool)
+    mask[:, -1] = False
+    loss_input = task._build_loss_inputs(model_out, {**b, "text_valid": mask})
+    expected = shifted.clone()
+    expected[:, -1] = -100
+    assert torch.equal(loss_input["labels"], expected)
 
 
 def test_coca_training_forward_produces_loss():
     model = TinyModel(has_logits=True)
     task = CoCaTask(model, loss=DummyCoCaLoss())
     task.train()
-    losses = task(_batch())
+    losses, _ = task(_batch())
     assert "loss" in losses
     # contrastive_loss (1.0) + caption_loss (0.5) = 1.5
     assert abs(losses["loss"].item() - 1.5) < 1e-6
@@ -149,7 +160,7 @@ def test_coca_compute_accum_loss_concatenates_batches():
     }
     inputs_no_accum = {"logit_scale": out1["logit_scale"]}
 
-    losses = task.compute_accum_loss(inputs, inputs_no_accum, accum_batches)
+    losses, _ = task.compute_accum_loss(inputs, inputs_no_accum, accum_batches)
     assert "contrastive_loss" in losses
     # Check that labels were built from concatenated texts
     # 4 samples total, shifted by 1 => (4, seq-1) labels

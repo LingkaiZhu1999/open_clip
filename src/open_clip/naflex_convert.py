@@ -137,6 +137,11 @@ def _force_naflex_timm_vision(vision_cfg: Dict[str, Any]) -> None:
 
 
 def apply_naflex_vision_config(model_cfg: Dict[str, Any]) -> None:
+    """Convert the vision tower config to a timm NaFlexVit (in place).
+
+    Other ``vision_cfg`` keys are preserved, including ``naflex_patch_interp`` (see ``CLIPVisionCfg``), which the
+    vision tower builder maps to timm's ``enable_patch_interpolator`` for NaFlexVit towers.
+    """
     vision_cfg = model_cfg['vision_cfg']
     if vision_cfg.get('timm_model_name'):
         _force_naflex_timm_vision(vision_cfg)

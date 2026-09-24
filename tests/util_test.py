@@ -11,8 +11,6 @@ torch.serialization.add_safe_globals([PIL.Image.Image])
 if __name__ != '__main__':
     import open_clip
 
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-
 def seed_all(seed = 0):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -20,6 +18,53 @@ def seed_all(seed = 0):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def create_tiny_model(family="clip", vision_layers=1):
+    """Real model families at unit-test scale; registry/config tests use their named models."""
+    vision = dict(image_size=32, patch_size=16, width=32, head_width=16, layers=vision_layers)
+    text = dict(context_length=8, vocab_size=64, width=32, heads=2, layers=1)
+    if family == "clip":
+        return open_clip.CLIP(embed_dim=32, vision_cfg=vision, text_cfg=text, output_dict=True)
+    vision["output_tokens"] = True
+    multimodal = dict(text, layers=2)
+    if family == "coca":
+        text.update(embed_cls=True, output_tokens=True)
+        return open_clip.CoCa(embed_dim=32, vision_cfg=vision, text_cfg=text, multimodal_cfg=multimodal)
+    if family == "mammut":
+        return open_clip.MaMMUT(embed_dim=32, vision_cfg=vision, multimodal_cfg=multimodal)
+    raise ValueError(f"Unknown test model family: {family}")
+
+
+def _default_caption_length(text):
+    return len(text) + 1
+
+
+class VariableTokenizer:
+    """Minimal tokenizer stub for variable-text data-pipeline tests.
+
+    The token count is derived from the caption via ``length_fn`` (default ``len(text) + 1``, i.e. body + eos).
+    ``pad=False`` returns per-sample 1-D tensors (the variable-text contract); ``pad=True`` right-pads each row
+    to ``context_length`` with ``pad_token_id``.
+    """
+    pad_token_id = 99
+    context_length = 16
+
+    def __init__(self, length_fn = None):
+        self.length_fn = _default_caption_length if length_fn is None else length_fn
+
+    def __call__(self, texts, pad = True):
+        if isinstance(texts, bytes):
+            texts = texts.decode('utf-8')
+        if isinstance(texts, str):
+            texts = [texts]
+        tokens = [torch.arange(1, self.length_fn(text) + 1, dtype=torch.long) for text in texts]
+        if not pad:
+            return tokens
+        out = torch.full((len(tokens), self.context_length), self.pad_token_id, dtype=torch.long)
+        for i, row in enumerate(tokens):
+            out[i, :row.numel()] = row
+        return out
 
 def inference_text(model, model_name, batches):
     y = []
@@ -323,4 +368,3 @@ def main(args):
 if __name__ == '__main__':
     import sys
     main(sys.argv[1:])
-

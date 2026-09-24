@@ -6,46 +6,23 @@ positional ``task(image, text)`` backward-compat in ``forward()``,
 Concrete tasks (CLIPTask, SigLIPTask, CoCaTask, DistillCLIPTask) inherit
 from this layer.
 
-Future modalities (NaFlex, CLAP, MamMuT) should derive directly from
-``TrainingTask`` and supply their own contract.
+Audio tasks supply their own modality contract and dummy batches.
 """
 import math
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-import torch.nn as nn
 
-from ..naflex_config import NaFlexDataConfig
 from .base_task import TrainingTask, unwrap_model
 
 
 class ImageTextTask(TrainingTask):
     """Image + text contract shared by CLIP-family tasks."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._naflex_data_config = None
-
     @property
     def data_keys(self) -> Tuple[str, ...]:
         """Keys expected in the batch dict from the data pipeline."""
         return ("image", "text")
-
-    @property
-    def naflex_data_config(self) -> Optional[NaFlexDataConfig]:
-        return self._naflex_data_config
-
-    @property
-    def naflex_eval_config(self) -> Optional[Tuple[Tuple[int, int], int]]:
-        return self._naflex_data_config.eval_config if self._naflex_data_config is not None else None
-
-    def set_naflex_data_config(
-            self,
-            naflex_data_config: Optional[NaFlexDataConfig],
-    ) -> 'ImageTextTask':
-        """Configure NaFlex train/eval data policy shared by data loaders and dummy batches."""
-        self._naflex_data_config = naflex_data_config
-        return self
 
     def create_dummy_batch(
             self,
@@ -61,10 +38,13 @@ class ImageTextTask(TrainingTask):
             context_length = model.context_length
 
         if self._naflex_data_config is not None:
+            naflex_cfg = self._naflex_data_config
             image = self._create_naflex_dummy_image(
                 batch_size=batch_size,
-                max_seq_len=self._naflex_data_config.eval_seq_len,
-                patch_size=self._naflex_data_config.eval_patch_size,
+                max_seq_len=naflex_cfg.eval_seq_len,
+                patch_size=naflex_cfg.eval_patch_size,
+                # Same rule as the real eval transform: only base-size patches are flattened.
+                flatten_patches=naflex_cfg.should_flatten_patches(naflex_cfg.eval_patch_size),
                 device=device,
                 dtype=dtype,
             )
@@ -88,9 +68,16 @@ class ImageTextTask(TrainingTask):
             device: Optional[torch.device] = None,
             dtype: Optional[torch.dtype] = None,
             num_channels: int = 3,
+            flatten_patches: bool = True,
     ) -> Dict[str, torch.Tensor]:
-        patch_dim = patch_size[0] * patch_size[1] * num_channels
-        patches = torch.zeros(batch_size, max_seq_len, patch_dim, device=device, dtype=dtype)
+        if flatten_patches:
+            patch_dim = patch_size[0] * patch_size[1] * num_channels
+            patches = torch.zeros(batch_size, max_seq_len, patch_dim, device=device, dtype=dtype)
+        else:
+            # Non-base patch size: keep (Ph, Pw, C) (channels-last, as timm's Patchify emits) so the tower can
+            # resample its projection weight instead of hitting a flat-dim mismatch.
+            patches = torch.zeros(
+                batch_size, max_seq_len, patch_size[0], patch_size[1], num_channels, device=device, dtype=dtype)
 
         width = math.ceil(math.sqrt(max_seq_len))
         patch_idx = torch.arange(max_seq_len, device=device)

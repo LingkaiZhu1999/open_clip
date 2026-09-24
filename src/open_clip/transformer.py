@@ -1,6 +1,7 @@
 from collections import OrderedDict
 import math
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
+import warnings
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 from torch import nn
@@ -9,40 +10,27 @@ from torch.utils.checkpoint import checkpoint
 
 from .utils import to_2tuple, feature_take_indices
 from .pos_embed import get_2d_sincos_pos_embed
+# Foundational layer primitives now live in layers.py; re-exported here so existing
+# `from .transformer import LayerNorm, LayerNormFp32, QuickGELU, ...` imports keep working.
+from .layers import LayerNorm, LayerNormFp32, LayerScale, QuickGELU
 
 
-class LayerNormFp32(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
-
-    def forward(self, x: torch.Tensor):
-        orig_type = x.dtype
-        x = F.layer_norm(x.to(torch.float32), self.normalized_shape, self.weight, self.bias, self.eps)
-        return x.to(orig_type)
+def _build_causal_mask(length: int) -> torch.Tensor:
+    return torch.full((length, length), float("-inf")).triu_(1)
 
 
-class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm (with cast back to input dtype)."""
-
-    def forward(self, x: torch.Tensor):
-        orig_type = x.dtype
-        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        return x.to(orig_type)
-
-
-class QuickGELU(nn.Module):
-    # NOTE This is slower than nn.GELU or nn.SiLU and uses more GPU memory
-    def forward(self, x: torch.Tensor):
-        return x * torch.sigmoid(1.702 * x)
-
-
-class LayerScale(nn.Module):
-    def __init__(self, dim, init_values=1e-5, inplace=False):
-        super().__init__()
-        self.inplace = inplace
-        self.gamma = nn.Parameter(init_values * torch.ones(dim))
-
-    def forward(self, x):
-        return x.mul_(self.gamma) if self.inplace else x * self.gamma
+def _text_valid_mask(text: torch.Tensor, pad_id: Optional[int], mask: Optional[torch.Tensor] = None):
+    if mask is not None:
+        valid = mask.bool()
+    elif pad_id is None:
+        return torch.ones_like(text, dtype=torch.bool)
+    else:
+        valid = text != pad_id
+    # Keep one valid position in all-pad rows, without data-dependent control flow under compile.
+    empty = ~valid.any(dim=1, keepdim=True)
+    first = torch.zeros_like(valid)
+    first[:, 0] = True
+    return valid | (empty & first)
 
 
 class PatchDropout(nn.Module):
@@ -294,11 +282,16 @@ class AttentionalPooler(nn.Module):
         self.ln_q = norm_layer(d_model)
         self.ln_k = norm_layer(context_dim)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, key_valid: Optional[torch.Tensor] = None):
+        """key_valid: optional [B, L] bool/int validity (True/1 = real K/V token). Padded keys are
+        excluded from pooling attention -- required for NaFlex/variable-length token inputs where
+        trailing positions are padding, not content."""
         N = x.shape[0]
         x = self.ln_k(x)
         q = self.ln_q(self.query)
-        out = self.attn(q.unsqueeze(0).expand(N, -1, -1), k_x=x, v_x=x)
+        # [B, 1, 1, L] bool key mask, broadcast over heads/queries (incl. all-invalid-row guard)
+        attn_mask = context_attn_mask_from_valid(key_valid)
+        out = self.attn(q.unsqueeze(0).expand(N, -1, -1), k_x=x, v_x=x, attn_mask=attn_mask)
         return out
 
 
@@ -344,7 +337,10 @@ class ResidualAttentionBlock(nn.Module):
     ):
         k_x = k_x if k_x is not None else q_x
         v_x = v_x if v_x is not None else q_x
-        attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            # align additive (float) masks with compute dtype; bool masks pass through untouched
+            # (SDPA and the manual masked_fill path both consume bool directly)
+            attn_mask = attn_mask.to(q_x.dtype)
         return self.attn(q_x, k_x=k_x, v_x=v_x, attn_mask=attn_mask)
 
     def forward(
@@ -410,97 +406,6 @@ class CustomResidualAttentionBlock(nn.Module):
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         x = x + self.ls_1(self.ln_attn(self.attn(self.ln_1(x), attn_mask=attn_mask)))
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
-        return x
-
-
-class CustomTransformer(nn.Module):
-    """ A custom transformer that can use different block types. """
-    def __init__(
-            self,
-            width: int,
-            layers: int,
-            heads: int,
-            mlp_ratio: float = 4.0,
-            ls_init_value: float = None,
-            act_layer: Type[nn.Module] = nn.GELU,
-            norm_layer: Type[nn.Module] = LayerNorm,
-            block_types: Union[str, List[str]] = 'CustomResidualAttentionBlock',
-    ):
-        super().__init__()
-        self.width = width
-        self.layers = layers
-        self.grad_checkpointing = False
-
-        if isinstance(block_types, str):
-            block_types = [block_types] * layers
-        assert len(block_types) == layers
-
-        def _create_block(bt: str):
-            if bt == 'CustomResidualAttentionBlock':
-                return CustomResidualAttentionBlock(
-                    width,
-                    heads,
-                    mlp_ratio=mlp_ratio,
-                    ls_init_value=ls_init_value,
-                    act_layer=act_layer,
-                    norm_layer=norm_layer,
-                )
-            else:
-                assert False
-
-        self.resblocks = nn.ModuleList([
-            _create_block(bt)
-            for bt in block_types
-        ])
-
-    def get_cast_dtype(self) -> torch.dtype:
-        return self.resblocks[0].get_weight_dtype()
-
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            attn_mask: Optional[torch.Tensor] = None,
-            indices: Optional[Union[int, List[int]]] = None,
-            stop_early: bool = False,
-    ):
-        take_indices, max_index = feature_take_indices(len(self.resblocks), indices)
-
-        intermediates = []
-        blocks = self.resblocks if not stop_early else self.resblocks[:max_index + 1]
-        for i, blk in enumerate(blocks):
-            if self.grad_checkpointing:
-                x = checkpoint(blk, x, None, None, attn_mask, use_reentrant=False)
-            else:
-                x = blk(x, attn_mask=attn_mask)
-
-            if i in take_indices:
-                intermediates.append(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(self, indices: Union[int, List[int]] = 1):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices, max_index = feature_take_indices(len(self.resblocks), indices)
-        self.resblocks = self.resblocks[:max_index + 1]  # truncate blocks
-        return take_indices
-
-    def set_grad_checkpointing(self, enable: bool = True, impl: str = 'inline'):
-        if impl == 'composable' and enable:
-            from torch.distributed._composable import checkpoint as composable_checkpoint
-            for r in self.resblocks:
-                composable_checkpoint(r)
-        else:
-            self.grad_checkpointing = enable
-
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-        for r in self.resblocks:
-            if self.grad_checkpointing:
-                # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
-                x = checkpoint(r, x, None, None, attn_mask, use_reentrant=False)
-            else:
-                x = r(x, attn_mask=attn_mask)
-
         return x
 
 
@@ -589,7 +494,7 @@ class Transformer(nn.Module):
         blocks = self.resblocks if not stop_early else self.resblocks[:max_index + 1]
         for i, blk in enumerate(blocks):
             if self.grad_checkpointing:
-                x = checkpoint(blk, x, None, None, attn_mask, use_reentrant=False)
+                x = checkpoint(blk, x, attn_mask=attn_mask, use_reentrant=False)
             else:
                 x = blk(x, attn_mask=attn_mask)
 
@@ -608,12 +513,34 @@ class Transformer(nn.Module):
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         for r in self.resblocks:
             if self.grad_checkpointing:
-                # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
-                x = checkpoint(r, x, None, None, attn_mask, use_reentrant=False)
+                x = checkpoint(r, x, attn_mask=attn_mask, use_reentrant=False)
             else:
                 x = r(x, attn_mask=attn_mask)
 
         return x
+
+
+class CustomTransformer(Transformer):
+    """Compatibility constructor for a Transformer with custom residual attention blocks."""
+    def __init__(
+            self,
+            width: int,
+            layers: int,
+            heads: int,
+            mlp_ratio: float = 4.0,
+            ls_init_value: float = None,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = LayerNorm,
+            block_types: Union[str, List[str]] = 'CustomResidualAttentionBlock',
+    ):
+        if isinstance(block_types, str):
+            block_types = [block_types] * layers
+        assert len(block_types) == layers
+        assert all(bt == 'CustomResidualAttentionBlock' for bt in block_types)
+        super().__init__(
+            width, layers, heads, mlp_ratio=mlp_ratio, ls_init_value=ls_init_value,
+            act_layer=act_layer, norm_layer=norm_layer, block_type='custom',
+        )
 
 
 def _expand_token(token, batch_size: int):
@@ -652,7 +579,7 @@ class VisionTransformer(nn.Module):
             scale_fc: bool = False,
     ):
         super().__init__()
-        assert pool_type in ('tok', 'avg', 'none')
+        assert pool_type in ('tok', 'avg', 'avg_all', 'none')
         self.output_tokens = output_tokens
         image_height, image_width = self.image_size = to_2tuple(image_size)
         patch_height, patch_width = self.patch_size = to_2tuple(patch_size)
@@ -708,6 +635,11 @@ class VisionTransformer(nn.Module):
 
         if attentional_pool:
             if isinstance(attentional_pool, str):
+                # paper CoCa pooling: task-specific poolers (generative n_queries + contrastive n=1),
+                # 'cascade' (paper default) pools contrastive from the generative pooler outputs,
+                # 'parallel' pools both from the encoder tokens. Poolers project width -> output_dim
+                # themselves, so ln_post normalizes the width-dim encoder tokens pre-pool and there is
+                # no extra final projection.
                 self.attn_pool_type = attentional_pool
                 self.pool_type = 'none'
                 if attentional_pool in ('parallel', 'cascade'):
@@ -719,12 +651,13 @@ class VisionTransformer(nn.Module):
                     )
                     self.attn_pool_contrastive = AttentionalPooler(
                         output_dim,
-                        width,
+                        width if attentional_pool == 'parallel' else output_dim,
                         n_head=attn_pooler_heads,
                         n_queries=1,
                     )
                 else:
                     assert False
+                pool_dim = width  # ln_post runs on encoder tokens, before the poolers
             else:
                 self.attn_pool_type = ''
                 self.pool_type = pool_type
@@ -735,49 +668,64 @@ class VisionTransformer(nn.Module):
                     n_queries=attn_pooler_queries,
                 )
                 self.attn_pool_contrastive = None
-            pool_dim = output_dim
+                pool_dim = output_dim
         else:
             self.attn_pool = None
+            self.attn_pool_contrastive = None
+            self.attn_pool_type = ''
             pool_dim = width
             self.pool_type = pool_type
 
         self.ln_post = norm_layer(pool_dim)
-        self.proj = nn.Parameter(scale * torch.randn(pool_dim, output_dim))
+        # parallel/cascade poolers already project to output_dim; no extra head projection
+        self.proj = None if self.attn_pool_type in ('parallel', 'cascade') else \
+            nn.Parameter(scale * torch.randn(pool_dim, output_dim))
 
         self.init_parameters()
 
+    def layer_groups(self, pooler_in_head: bool = True):
+        """Ordered, complete partition into named ``(name, [members])`` groups, input -> output, shared by ``lock``
+        and layer-wise LR decay. Groups: ``embeddings`` (patch conv + class/pos embeds + ln_pre), ``layer.{i}``
+        (transformer blocks; the final block is grouped with ``ln_post``), and ``proj`` (the readout head:
+        attentional pooler(s) when configured, plus the projection). ``pooler_in_head`` is accepted for a common
+        signature with the text towers but has no effect here.
+        """
+        embed = [
+            m for m in (
+                self.conv1,
+                getattr(self, "class_embedding", None),
+                getattr(self, "positional_embedding", None),
+                self.ln_pre,
+            )
+            if m is not None
+        ]
+        groups = [("embeddings", embed)]
+        resblocks = self.transformer.resblocks
+        n = len(resblocks)
+        for i, block in enumerate(resblocks):
+            members = [block]
+            if i == n - 1:
+                members.append(self.ln_post)
+            groups.append((f"layer.{i}", members))
+        # readout head: attentional pooler(s) (legacy CoCa single pooler, or paper parallel/cascade pair,
+        # where proj is None and the poolers ARE the head) + optional projection
+        head = [
+            m for m in (self.attn_pool, self.attn_pool_contrastive, self.proj)
+            if m is not None
+        ]
+        if head:
+            groups.append(("proj", head))
+        return groups
+
     def lock(self, unlocked_groups: int = 0, freeze_bn_stats: bool = False):
-        for param in self.parameters():
-            param.requires_grad = False
-
-        if unlocked_groups != 0:
-            groups = [
-                [
-                    self.conv1,
-                    self.class_embedding,
-                    self.positional_embedding,
-                    self.ln_pre,
-                ],
-                *self.transformer.resblocks[:-1],
-                [
-                    self.transformer.resblocks[-1],
-                    self.ln_post,
-                ],
-                self.proj,
-            ]
-
-            def _unlock(x):
-                if isinstance(x, Sequence):
-                    for g in x:
-                        _unlock(g)
-                else:
-                    if isinstance(x, torch.nn.Parameter):
-                        x.requires_grad = True
-                    else:
-                        for p in x.parameters():
-                            p.requires_grad = True
-
-            _unlock(groups[-unlocked_groups:])
+        # Freeze the tower top-down via the shared ``layer_groups`` enumeration: ``unlocked_groups`` counts the top
+        # groups (the proj head first) left trainable, so unlocked_groups=0 freezes everything. Each group is set
+        # explicitly (frozen -> False, unlocked -> True) so repeated calls with different counts are idempotent
+        # (e.g. progressive unfreezing / multi-stage training).
+        groups = self.layer_groups()
+        n_freeze = len(groups) if not unlocked_groups else len(groups) - unlocked_groups
+        for i, (_, members) in enumerate(groups):
+            _set_group_requires_grad(members, requires_grad=(i >= n_freeze))
 
     def init_parameters(self):
         # FIXME OpenAI CLIP did not define an init for the VisualTransformer
@@ -810,6 +758,9 @@ class VisionTransformer(nn.Module):
     def _global_pool(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.pool_type == 'avg':
             pooled, tokens = x[:, 1:].mean(dim=1), x[:, 1:]
+        elif self.pool_type == 'avg_all':
+            # mean over all tokens, class token included (MaMMUT / legacy openMaMMUT weights)
+            pooled, tokens = x.mean(dim=1), x
         elif self.pool_type == 'tok':
             pooled, tokens = x[:, 0], x[:, 1:]
         else:
@@ -837,14 +788,18 @@ class VisionTransformer(nn.Module):
     def _pool(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.attn_pool is not None:
             if self.attn_pool_contrastive is not None:
-                # This is untested, WIP pooling that should match paper
-                x = self.ln_post(x)  # TBD LN first or separate one after each pool?
+                # paper CoCa pooling: normalize encoder tokens, then task-specific poolers -- the
+                # generative pooler feeds the caption decoder's cross-attention, the single-query
+                # contrastive pooler yields the retrieval embedding. 'cascade' (paper default)
+                # pools contrastive from the generative pooler outputs, 'parallel' from the tokens.
+                x = self.ln_post(x)  # width-dim norm on encoder tokens, pre-pool
                 tokens = self.attn_pool(x)
                 if self.attn_pool_type == 'parallel':
                     pooled = self.attn_pool_contrastive(x)
                 else:
                     assert self.attn_pool_type == 'cascade'
                     pooled = self.attn_pool_contrastive(tokens)
+                pooled = pooled[:, 0]  # single contrastive query -> [B, output_dim]
             else:
                 # this is the original OpenCLIP CoCa setup, does not match paper
                 x = self.attn_pool(x)
@@ -951,7 +906,7 @@ class VisionTransformer(nn.Module):
 
         if self.output_tokens:
             return pooled, tokens
-        
+
         return pooled
 
 
@@ -960,11 +915,21 @@ def text_global_pool(
         text: Optional[torch.Tensor] = None,
         pool_type: str = 'argmax',
         eos_token_id: Optional[int] = None,
+        valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if pool_type == 'first':
         pooled = x[:, 0]
     elif pool_type == 'last':
         pooled = x[:, -1]
+    elif pool_type == 'avg':
+        if valid is not None:
+            # masked mean over valid positions ([B, L] bool, True = keep); callers guarantee at least
+            # one valid position per row (see e.g. MultimodalDecoder._valid_mask)
+            weights = valid.to(x.dtype).unsqueeze(-1)
+            pooled = (x * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+        else:
+            # unmasked mean over full sequence, pad positions included (MaMMUT legacy)
+            pooled = x.mean(dim=1)
     elif pool_type == 'argmax':
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         assert text is not None
@@ -979,6 +944,814 @@ def text_global_pool(
         pooled = x
 
     return pooled
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, bias: bool = True):
+        super().__init__()
+        self.w12 = nn.Linear(dim, hidden_dim * 2, bias=bias)
+        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, gate = self.w12(x).chunk(2, dim=-1)
+        return self.w3(x * F.silu(gate))
+
+
+class ReLUSquared(nn.Module):
+    """Squared-ReLU activation (Primer); simpler than SwiGLU and competitive at small model scale."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(x).square()
+
+
+class RotaryEmbedding1D(nn.Module):
+    def __init__(self, dim: int, temperature: float = 10000.0):
+        super().__init__()
+        if dim % 2:
+            raise ValueError(f"RoPE head dim must be even, got {dim}.")
+        inv_freq = 1.0 / (temperature ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return cos/sin concatenated as one ``[seq_len, head_dim]`` table (cos | sin halves).
+
+        Computed once per forward in the parent tower and threaded through every block (timm-style cat layout),
+        rather than recomputed per layer.
+        """
+        pos = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(pos, self.inv_freq.to(device=device))
+        return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype=dtype)
+
+
+def _apply_rope_1d(x: torch.Tensor, rope_embed: torch.Tensor) -> torch.Tensor:
+    cos, sin = rope_embed.chunk(2, dim=-1)
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
+
+
+class ModernTextAttention(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            heads: int,
+            qk_norm: bool = False,
+            norm_layer: Optional[Callable[[int], nn.Module]] = None,
+            gated: bool = False,
+            value_residual: bool = False,
+            vr_first: bool = False,
+            bias: bool = True,
+            gate_bias: bool = True,
+    ):
+        super().__init__()
+        if dim % heads:
+            raise ValueError(f"text width {dim} must be divisible by heads {heads}.")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=bias)
+        # qk-norm over head_dim follows the model's norm type (norm_layer), default RMSNorm.
+        qk_norm_layer = norm_layer if norm_layer is not None else (lambda d: nn.RMSNorm(d, eps=1e-6))
+        self.q_norm = qk_norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = qk_norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        # Gate bias is decoupled from `bias` so the mostly-open init (init_parameters) can survive bias-free attn.
+        self.gate = nn.Linear(dim, dim, bias=gate_bias) if gated else None
+        # Value residual (ResFormer): mix this layer's V with layer-0's V via a learned scalar,
+        # v = lerp(v_first, v, vr_lambda); init 0.5 = equal mix, lambda -> 1 recovers plain attention.
+        # Layer 0 only *produces* v_first (vr_first), so it gets no lambda (an unused param breaks DDP).
+        self.value_residual = value_residual
+        self.vr_lambda = nn.Parameter(torch.full((1,), 0.5)) if (value_residual and not vr_first) else None
+        self.proj = nn.Linear(dim, dim, bias=bias)
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            rope_embed: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+            is_causal: bool = False,
+            v_first: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        b, l, c = x.shape
+        qkv = self.qkv(x).reshape(b, l, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        v_out = None
+        if self.value_residual:
+            # Layer 0 (v_first None) contributes its raw V; later layers mix and propagate v_first unchanged.
+            # vr_lambda stays fp32 under static low-precision conversion (convert_weights_to_lp only converts
+            # module weights), so cast at use like reg_tokens / norm weights.
+            v_out = v if v_first is None else v_first
+            if self.vr_lambda is not None and v_first is not None:
+                v = torch.lerp(v_first, v, self.vr_lambda.to(v.dtype))
+        q, k = self.q_norm(q), self.k_norm(k)
+        if rope_embed is not None:
+            q = _apply_rope_1d(q, rope_embed)
+            k = _apply_rope_1d(k, rope_embed)
+        # Causal mode passes is_causal (no mask tensor); bidirectional passes a [B, 1, 1, L] key-pad bias. SDPA
+        # forbids both at once, and the two are mutually exclusive here (see ModernTextTransformer._attn_inputs).
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+        out = out.transpose(1, 2).reshape(b, l, c)
+        if self.gate is not None:
+            out = out * self.gate(x).sigmoid()
+        return self.proj(out), v_out
+
+
+class ModernTextCrossAttention(nn.Module):
+    """Cross-attention sublayer for the modern multimodal decoder: text queries over a token
+    context (e.g. image tokens). No RoPE (text and context positions have no shared coordinate
+    system) and no value residual (a self-attention stream concept). ``context_attn_mask``
+    (SDPA contract: bool True = attend, or float additive; broadcastable to
+    ``[B, H, L_text, L_ctx]``) masks context keys when the context carries padding
+    (e.g. NaFlex patch batches); ``None`` = dense context."""
+
+    def __init__(
+            self,
+            dim: int,
+            heads: int,
+            qk_norm: bool = False,
+            norm_layer: Optional[Callable[[int], nn.Module]] = None,
+            gated: bool = False,
+            bias: bool = True,
+            gate_bias: bool = True,
+    ):
+        super().__init__()
+        if dim % heads:
+            raise ValueError(f"text width {dim} must be divisible by heads {heads}.")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.q = nn.Linear(dim, dim, bias=bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=bias)
+        # qk-norm over head_dim follows the model's norm type (norm_layer), default RMSNorm.
+        qk_norm_layer = norm_layer if norm_layer is not None else (lambda d: nn.RMSNorm(d, eps=1e-6))
+        self.q_norm = qk_norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = qk_norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        # Output gate driven by the text input, like ModernTextAttention.
+        self.gate = nn.Linear(dim, dim, bias=gate_bias) if gated else None
+        self.proj = nn.Linear(dim, dim, bias=bias)
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            context: torch.Tensor,
+            context_attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        b, l, c = x.shape
+        n = context.shape[1]
+        q = self.q(x).reshape(b, l, self.heads, self.head_dim).transpose(1, 2)
+        kv = self.kv(context).reshape(b, n, 2, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=context_attn_mask)
+        out = out.transpose(1, 2).reshape(b, l, c)
+        if self.gate is not None:
+            out = out * self.gate(x).sigmoid()
+        return self.proj(out)
+
+
+class ModernTextBlock(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            heads: int,
+            mlp_ratio: float,
+            norm_layer: Callable[[int], nn.Module],
+            qk_norm: bool = False,
+            attn_gated: bool = False,
+            mlp_type: str = "swiglu",
+            norm_placement: str = "pre",
+            ls_init_value: Optional[float] = None,
+            value_residual: bool = False,
+            vr_first: bool = False,
+            attn_bias: bool = True,
+            gate_bias: bool = True,
+            mlp_bias: bool = True,
+    ):
+        super().__init__()
+        if norm_placement not in ("pre", "sandwich"):
+            raise ValueError(f"unknown modern text norm_placement={norm_placement!r}")
+        sandwich = norm_placement == "sandwich"
+        self.norm1 = norm_layer(dim)
+        self.attn = ModernTextAttention(
+            dim,
+            heads,
+            qk_norm=qk_norm,
+            norm_layer=norm_layer,
+            gated=attn_gated,
+            value_residual=value_residual,
+            vr_first=vr_first,
+            bias=attn_bias,
+            gate_bias=gate_bias,
+        )
+        # Sandwich placement (Gemma-2 style): an extra norm on each sublayer *output*, before LayerScale and
+        # the residual add; widens the stable-LR range at the cost of two extra norms per block.
+        self.norm1_post = norm_layer(dim) if sandwich else nn.Identity()
+        self.ls1 = LayerScale(dim, ls_init_value) if ls_init_value is not None else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        hidden = int(dim * mlp_ratio)
+        if mlp_type == "swiglu":
+            self.mlp = SwiGLU(dim, hidden, bias=mlp_bias)
+        elif mlp_type in ("mlp", "relu2"):
+            self.mlp = nn.Sequential(OrderedDict([
+                ("c_fc", nn.Linear(dim, hidden, bias=mlp_bias)),
+                ("act", nn.GELU() if mlp_type == "mlp" else ReLUSquared()),
+                ("c_proj", nn.Linear(hidden, dim, bias=mlp_bias)),
+            ]))
+        else:
+            raise ValueError(f"unknown modern text mlp_type={mlp_type!r}")
+        self.norm2_post = norm_layer(dim) if sandwich else nn.Identity()
+        self.ls2 = LayerScale(dim, ls_init_value) if ls_init_value is not None else nn.Identity()
+
+    def get_weight_dtype(self) -> torch.dtype:
+        return self.attn.qkv.weight.dtype
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            rope_embed: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+            is_causal: bool = False,
+            v_first: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attn_out, v_first = self.attn(
+            self.norm1(x), rope_embed=rope_embed, attn_mask=attn_mask, is_causal=is_causal, v_first=v_first,
+        )
+        x = x + self.ls1(self.norm1_post(attn_out))
+        x = x + self.ls2(self.norm2_post(self.mlp(self.norm2(x))))
+        return x, v_first
+
+
+class ModernTextDecoderBlock(ModernTextBlock):
+    """ModernTextBlock with an optional cross-attention sublayer between self-attention and the MLP
+    (modern multimodal decoder). A separate subclass so the encoder block -- and existing modern text
+    encoder checkpoints -- stay untouched; base sublayer state-dict keys are identical, cross sublayers
+    add new keys (norm_x, xattn.*, norm_x_post, ls_x) only on blocks that have them.
+
+    The cross sublayer runs only when a ``context`` is passed, so a contrastive (text-only) pass through
+    a cross-enabled block skips it entirely.
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            heads: int,
+            mlp_ratio: float,
+            norm_layer: Callable[[int], nn.Module],
+            qk_norm: bool = False,
+            attn_gated: bool = False,
+            mlp_type: str = "swiglu",
+            norm_placement: str = "pre",
+            ls_init_value: Optional[float] = None,
+            value_residual: bool = False,
+            vr_first: bool = False,
+            attn_bias: bool = True,
+            gate_bias: bool = True,
+            mlp_bias: bool = True,
+            cross_attn: bool = False,
+    ):
+        super().__init__(
+            dim,
+            heads,
+            mlp_ratio,
+            norm_layer,
+            qk_norm=qk_norm,
+            attn_gated=attn_gated,
+            mlp_type=mlp_type,
+            norm_placement=norm_placement,
+            ls_init_value=ls_init_value,
+            value_residual=value_residual,
+            vr_first=vr_first,
+            attn_bias=attn_bias,
+            gate_bias=gate_bias,
+            mlp_bias=mlp_bias,
+        )
+        if cross_attn:
+            sandwich = norm_placement == "sandwich"
+            self.norm_x = norm_layer(dim)
+            self.xattn = ModernTextCrossAttention(
+                dim,
+                heads,
+                qk_norm=qk_norm,
+                norm_layer=norm_layer,
+                gated=attn_gated,
+                bias=attn_bias,
+                gate_bias=gate_bias,
+            )
+            self.norm_x_post = norm_layer(dim) if sandwich else nn.Identity()
+            self.ls_x = LayerScale(dim, ls_init_value) if ls_init_value is not None else nn.Identity()
+        else:
+            self.xattn = None
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            rope_embed: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+            is_causal: bool = False,
+            v_first: Optional[torch.Tensor] = None,
+            context: Optional[torch.Tensor] = None,
+            context_attn_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attn_out, v_first = self.attn(
+            self.norm1(x), rope_embed=rope_embed, attn_mask=attn_mask, is_causal=is_causal, v_first=v_first,
+        )
+        x = x + self.ls1(self.norm1_post(attn_out))
+        if self.xattn is not None and context is not None:
+            x = x + self.ls_x(self.norm_x_post(self.xattn(self.norm_x(x), context, context_attn_mask)))
+        x = x + self.ls2(self.norm2_post(self.mlp(self.norm2(x))))
+        return x, v_first
+
+
+class ModernTextPool(nn.Module):
+    def __init__(
+            self,
+            width: int,
+            pool_type: str = "eos",
+            heads: int = 8,
+            norm_layer: Optional[Callable[[int], nn.Module]] = None,
+            bias: bool = True,
+            qk_norm: bool = False,
+    ):
+        super().__init__()
+        self.pool_type = pool_type
+        self.heads = heads
+        if pool_type == "map":
+            if width % heads:
+                raise ValueError(f"text width {width} must be divisible by MAP heads {heads}.")
+            self.head_dim = width // heads
+            self.query = nn.Parameter(torch.empty(1, 1, width))
+            self.q = nn.Linear(width, width, bias=bias)
+            self.kv = nn.Linear(width, width * 2, bias=bias)
+            # qk-norm over head_dim (bf16 logit stability, as in the blocks): model norm type, default RMSNorm.
+            # No kv pre-norm -- ln_final already normalises the pool input.
+            qk_norm_layer = norm_layer if norm_layer is not None else (lambda d: nn.RMSNorm(d, eps=1e-6))
+            self.q_norm = qk_norm_layer(self.head_dim) if qk_norm else nn.Identity()
+            self.k_norm = qk_norm_layer(self.head_dim) if qk_norm else nn.Identity()
+            nn.init.normal_(self.query, std=width ** -0.5)
+        elif pool_type in ("eos", "mean"):
+            self.query = None
+        else:
+            # NOTE: no 'last' here on purpose -- in open_clip 'last' means the last *physical* position
+            # (SigLIP / CLIPA fixed-length contract), which is padding for this variable-length tower. The
+            # masked equivalent (last valid token) is the no-eos-in-row fallback of the 'eos' branch.
+            raise ValueError(f"unknown modern text pool_type={pool_type!r}")
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            text: torch.Tensor,
+            valid: torch.Tensor,
+            eos_id: Optional[int],
+    ) -> torch.Tensor:
+        if self.pool_type == "mean":
+            weights = valid.to(x.dtype)
+            return (x * weights.unsqueeze(-1)).sum(dim=1) / weights.sum(dim=1, keepdim=True).clamp(min=1)
+        if self.pool_type == "eos":
+            # Pool at the first eos_id occurrence; rows without one (eos lost to truncation) fall back to the
+            # last valid (non-pad) token, which is where the eos would sit under the right-padded contract.
+            eos = text == eos_id
+            last_valid = valid.long().sum(dim=1).sub(1).clamp(min=0)
+            idx = torch.where(eos.any(dim=1), eos.int().argmax(dim=1), last_valid)
+            return x[torch.arange(x.shape[0], device=x.device), idx]
+
+        b, l, c = x.shape
+        # The learned query latent stays fp32 under static low-precision conversion; cast at use.
+        q = self.q(self.query.to(x.dtype).expand(b, -1, -1)).reshape(b, 1, self.heads, self.head_dim).transpose(1, 2)
+        kv = self.kv(x).reshape(b, l, 2, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+        attn_bias = x.new_zeros((b, 1, 1, l))
+        attn_bias.masked_fill_(~valid[:, None, None, :], torch.finfo(x.dtype).min)
+        pooled = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, is_causal=False)
+        return pooled.transpose(1, 2).reshape(b, c)
+
+
+def _reset_submodule_parameters(module: nn.Module):
+    """Reset standard child modules before applying an architecture-specific init scheme."""
+    for child in module.modules():
+        if child is module:
+            continue
+        reset_parameters = getattr(child, "reset_parameters", None)
+        if callable(reset_parameters):
+            reset_parameters()
+
+
+def _init_modern_text_block(
+        block: ModernTextBlock,
+        attn_std: float,
+        fc_std: float,
+        proj_std: float,
+        swiglu_fc_std: float,
+        zero_residual: bool,
+):
+    """Init one modern text block (see ModernTextTransformer.init_parameters for the scheme rationale).
+
+    Shared by ModernTextTransformer and ModernMultimodalDecoder; also handles the optional cross-attention
+    sublayer of ModernTextDecoderBlock (mirroring the self-attention treatment).
+    """
+    def init_residual_out(weight):
+        if zero_residual:
+            nn.init.zeros_(weight)
+        else:
+            nn.init.normal_(weight, std=proj_std)
+
+    attn = block.attn
+    nn.init.normal_(attn.qkv.weight, std=attn_std)
+    if attn.qkv.bias is not None:
+        nn.init.zeros_(attn.qkv.bias)
+    init_residual_out(attn.proj.weight)
+    if attn.proj.bias is not None:
+        nn.init.zeros_(attn.proj.bias)
+    if attn.gate is not None:
+        # Mostly-open gate at init: bias 1 -> sigmoid(1) ~= 0.73, so gating starts near-transparent
+        # (a half-open 0.5 gate halves attention output magnitude, fighting the residual init scheme).
+        # Needs a gate bias to exist: set gate_bias=True to keep this when attention_bias is off, else the
+        # bias-free gate falls back to sigmoid(~0) ~= 0.5.
+        nn.init.normal_(attn.gate.weight, std=attn_std)
+        if attn.gate.bias is not None:
+            nn.init.ones_(attn.gate.bias)
+    if attn.vr_lambda is not None:
+        nn.init.constant_(attn.vr_lambda, 0.5)  # equal layer-0 / current-layer value mix at init
+    xattn = getattr(block, 'xattn', None)
+    if xattn is not None:
+        nn.init.normal_(xattn.q.weight, std=attn_std)
+        if xattn.q.bias is not None:
+            nn.init.zeros_(xattn.q.bias)
+        nn.init.normal_(xattn.kv.weight, std=attn_std)
+        if xattn.kv.bias is not None:
+            nn.init.zeros_(xattn.kv.bias)
+        init_residual_out(xattn.proj.weight)
+        if xattn.proj.bias is not None:
+            nn.init.zeros_(xattn.proj.bias)
+        if xattn.gate is not None:
+            nn.init.normal_(xattn.gate.weight, std=attn_std)
+            if xattn.gate.bias is not None:
+                nn.init.ones_(xattn.gate.bias)
+    mlp = block.mlp
+    if isinstance(mlp, SwiGLU):
+        nn.init.normal_(mlp.w12.weight, std=swiglu_fc_std)
+        if mlp.w12.bias is not None:
+            nn.init.zeros_(mlp.w12.bias)
+        init_residual_out(mlp.w3.weight)
+        if mlp.w3.bias is not None:
+            nn.init.zeros_(mlp.w3.bias)
+    else:  # nn.Sequential MLP (c_fc, act, c_proj)
+        nn.init.normal_(mlp.c_fc.weight, std=fc_std)
+        if mlp.c_fc.bias is not None:
+            nn.init.zeros_(mlp.c_fc.bias)
+        init_residual_out(mlp.c_proj.weight)
+        if mlp.c_proj.bias is not None:
+            nn.init.zeros_(mlp.c_proj.bias)
+
+
+class ModernTextTransformer(nn.Module):
+    """Dedicated variable-length text tower: RoPE, SwiGLU/ReLU^2, masked pooling, and optional gated attention,
+    qk-norm, embedding pre-norm, sandwich norms, register tokens, and layer-0 value residuals."""
+
+    def __init__(
+            self,
+            cfg: Any,
+            output_dim: int,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.variable_text = bool(getattr(cfg, "variable_text", False))
+        # Classic 'argmax' pooling (CLIP picks the EOT as the max token id) maps to 'eos' here: same intent,
+        # keyed on the configured eos token id. eos_id has no config default and is validated below (and against
+        # the tokenizer in get_tokenizer), so a stale/wrong id fails fast instead of pooling silently wrong.
+        pool_type = "eos" if cfg.pool_type == "argmax" else cfg.pool_type
+        if pool_type == "eos" and cfg.eos_id is None:
+            raise ValueError(
+                "modern text 'eos' (or 'argmax') pooling requires text_cfg.eos_id "
+                "(must match the tokenizer eos/eot token id)."
+            )
+
+        if cfg.attention_mode not in ("causal", "bidirectional"):
+            raise ValueError(f"unknown modern text attention_mode={cfg.attention_mode!r}")
+        if cfg.pos_embed not in ("rope", "none", ""):
+            raise ValueError(f"unknown modern text pos_embed={cfg.pos_embed!r}")
+        if cfg.width % cfg.heads != 0:
+            raise ValueError(f"modern text width ({cfg.width}) must be divisible by heads ({cfg.heads}).")
+        if cfg.pos_embed == "rope" and (cfg.width // cfg.heads) % 2 != 0:
+            raise ValueError(
+                f"modern text RoPE head dim must be even, got width / heads = {cfg.width // cfg.heads}."
+            )
+
+        # Public text-tower API used by CustomTextCLIP/CLAP, tokenizer checks, training setup, and generation
+        # token-id resolution. The tokenizer contract is public (context/vocab sizes and the pad/bos/eos special
+        # token ids -- bos is passthrough here but part of the cross-tower contract; HFTextEncoder normalizes it
+        # from cls, classic TextTransformer retains no cfg). Keep architecture knobs in cfg or private fields so
+        # they do not become accidental model attributes.
+        self.context_length = cfg.context_length
+        self.num_pos = cfg.context_length
+        self.vocab_size = cfg.vocab_size
+        self.width = cfg.width
+        self.layers = cfg.layers
+        self.output_dim = output_dim
+        self.pad_id = cfg.pad_id
+        self.bos_id = cfg.bos_id
+        self.eos_id = cfg.eos_id
+
+        # norm_type is tri-state on the shared cfg (None = arch default); the modern tower defaults to RMSNorm.
+        norm_type = cfg.norm_type if cfg.norm_type is not None else "rmsnorm"
+        if norm_type == "rmsnorm":
+            norm_layer = lambda dim: nn.RMSNorm(dim, eps=cfg.norm_eps)
+        elif norm_type == "layernorm":
+            norm_layer = lambda dim: LayerNorm(dim, eps=cfg.norm_eps)
+        else:
+            raise ValueError(f"unknown modern text norm_type={norm_type!r}")
+
+        # freeze_pad_embed (tri-state, default True): zero-init + grad-freeze the pad embedding row via
+        # padding_idx. Disable when the pad id is a real vocab token (SimpleTokenizer fills with 0 == '!').
+        freeze_pad = getattr(cfg, 'freeze_pad_embed', None)
+        freeze_pad = True if freeze_pad is None else bool(freeze_pad)
+        self.token_embedding = nn.Embedding(
+            cfg.vocab_size, cfg.width, padding_idx=cfg.pad_id if freeze_pad else None)
+        # Learned register tokens: prepended to the sequence (always valid) and excluded from pooling. In
+        # bidirectional mode they are true scratch positions (read and write the whole sequence). In causal
+        # mode the prefix can only be *attended to*, not read from text, so they act as learned attention
+        # sinks -- still useful for soaking up sink/outlier mass, but a weaker mechanism than bidirectional
+        # registers, and largely redundant with a BOS token.
+        self.num_reg = max(0, int(getattr(cfg, "reg_tokens", 0) or 0))
+        self.reg_tokens = nn.Parameter(torch.empty(1, self.num_reg, cfg.width)) if self.num_reg else None
+        # One rope module on the tower; the cos/sin table is computed once per forward and threaded through the
+        # blocks (ModernTextAttention applies it), instead of being recomputed inside every layer.
+        self.rope = RotaryEmbedding1D(
+            cfg.width // cfg.heads,
+            temperature=cfg.rope_temperature,
+        ) if cfg.pos_embed == "rope" else None
+        # Embedding norm before block 0 (timm ViT pre_norm / norm_pre; ModernBERT embeddings.norm), applied
+        # after register concat.
+        self.norm_pre = norm_layer(cfg.width) if getattr(cfg, "pre_norm", False) else nn.Identity()
+        # attention_bias/mlp_bias are tri-state on the shared cfg (None = arch default). This is the modern tower,
+        # so None resolves off; bool() collapses None/False -> False, True -> True. attention_bias covers
+        # qkv/proj/gate + MAP q/kv, mlp_bias the MLP.
+        attention_bias = bool(getattr(cfg, "attention_bias", None))
+        mlp_bias = bool(getattr(cfg, "mlp_bias", None))
+        # Gate-bias override: None inherits attention_bias; True/False force on/off so the mostly-open gate init
+        # stays available with attention_bias off (see init_parameters).
+        gate_bias_cfg = getattr(cfg, "gate_bias", None)
+        gate_bias = attention_bias if gate_bias_cfg is None else bool(gate_bias_cfg)
+        self.blocks = nn.ModuleList([
+            ModernTextBlock(
+                cfg.width,
+                cfg.heads,
+                mlp_ratio=cfg.mlp_ratio,
+                norm_layer=norm_layer,
+                qk_norm=cfg.qk_norm,
+                attn_gated=cfg.attn_gated,
+                mlp_type=cfg.mlp_type,
+                norm_placement=getattr(cfg, "norm_placement", "pre"),
+                ls_init_value=cfg.ls_init_value,
+                value_residual=getattr(cfg, "value_residual", False),
+                vr_first=(i == 0),
+                attn_bias=attention_bias,
+                gate_bias=gate_bias,
+                mlp_bias=mlp_bias,
+            )
+            for i in range(cfg.layers)
+        ])
+        self.ln_final = norm_layer(cfg.width)
+        self.pool = ModernTextPool(
+            cfg.width,
+            pool_type=pool_type,
+            heads=cfg.heads,
+            norm_layer=norm_layer,
+            bias=attention_bias,
+            qk_norm=cfg.qk_norm,
+        )
+        self.text_projection = (
+            None
+            if cfg.proj_type == "none" or not output_dim
+            else nn.Linear(cfg.width, output_dim, bias=cfg.proj_bias)
+        )
+        self.grad_checkpointing = False
+        self.init_parameters()
+
+    def init_parameters(self):
+        _reset_submodule_parameters(self)
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+        if self.token_embedding.padding_idx is not None:
+            with torch.no_grad():
+                self.token_embedding.weight[self.token_embedding.padding_idx].zero_()
+        if self.reg_tokens is not None:
+            # timm cls/reg token convention: near-zero so registers start as blank slates that attention
+            # cannot initially key onto, growing only as needed.
+            nn.init.normal_(self.reg_tokens, std=1e-6)
+
+        # Block init scheme:
+        # - 'pre' norm (default): GPT-2 / CLIP convention -- inputs at `width**-0.5`, residual out-projs
+        #   (`proj`, `w3` / `c_proj`) scaled by `(2*layers)**-0.5` to keep residual variance flat with depth.
+        # - 'sandwich' norm: flat N(0, 0.02) (OLMo2-style); the post-norms undo depth scaling anyway.
+        # - `zero_init_residual`: out-projs zeroed -> identity blocks at init; supersedes the depth factor
+        #   (overlaps with `ls_init_value` -- prefer one or the other).
+        # Norm weights stay 1.0 (set in constructors); biases zeroed except the attention gate.
+        sandwich = getattr(self.cfg, "norm_placement", "pre") == "sandwich"
+        zero_residual = bool(getattr(self.cfg, "zero_init_residual", False))
+        attn_std = 0.02 if sandwich else self.width ** -0.5
+        fc_std = 0.02 if sandwich else (2 * self.width) ** -0.5
+        proj_std = 0.02 if sandwich else attn_std * ((2 * self.layers) ** -0.5)
+        # SwiGLU correction ('pre' scheme only): the gate product `u * silu(v)` carries ~2.4x less variance at
+        # init than the GELU hidden `fc_std` assumes; 1.22x on `w12` (MC-calibrated, width-independent since
+        # pre-act var is exactly 1/2 under this scheme) restores parity.
+        swiglu_fc_std = fc_std if sandwich else fc_std * 1.22
+
+        for block in self.blocks:
+            _init_modern_text_block(
+                block,
+                attn_std=attn_std,
+                fc_std=fc_std,
+                proj_std=proj_std,
+                swiglu_fc_std=swiglu_fc_std,
+                zero_residual=zero_residual,
+            )
+
+        # The pool/head init is scheme-independent: the block-init choice (flat/sandwich, zero-residual) only
+        # governs the residual stream, not the readout.
+        if getattr(self.pool, "query", None) is not None:
+            nn.init.normal_(self.pool.query, std=self.width ** -0.5)
+            nn.init.normal_(self.pool.q.weight, std=self.width ** -0.5)
+            if self.pool.q.bias is not None:
+                nn.init.zeros_(self.pool.q.bias)
+            nn.init.normal_(self.pool.kv.weight, std=self.width ** -0.5)
+            if self.pool.kv.bias is not None:
+                nn.init.zeros_(self.pool.kv.bias)
+
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection.weight, std=self.width ** -0.5)
+            if self.text_projection.bias is not None:
+                nn.init.zeros_(self.text_projection.bias)
+
+    def _valid_mask(self, text: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return _text_valid_mask(text, self.pad_id, attention_mask)
+
+    def _attn_inputs(
+            self,
+            text: torch.Tensor,
+            dtype: torch.dtype,
+            num_prefix: int = 0,
+            attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[bool, Optional[torch.Tensor], torch.Tensor]:
+        """Resolve SDPA attention inputs for this batch as ``(is_causal, attn_mask, valid)``.
+
+        The branch is on the static attention mode (no data-dependent control flow, so torch.compile
+        sees one graph per mode):
+
+        - ``"causal"``: ``is_causal=True`` with **no** mask tensor. Captions are right-padded (the collators fill
+          the tail with ``pad_id``), so under the causal constraint real tokens never attend to pad positions and
+          pad-position outputs are discarded at pooling -- masking pad keys is a no-op for the pooled output, and
+          dropping the ``[B, 1, L, L]`` mask removes the L^2 materialization (the dominant memory + compile cost).
+        - ``"bidirectional"``: a ``[B, 1, 1, L]`` additive key-pad bias (broadcast over the query axis); real
+          tokens here *can* see pads, so the mask is required.
+
+        ``num_prefix`` always-valid positions (register tokens) are prepended to the key axis of the bias;
+        the returned ``valid`` covers the text positions only (it drives pooling, which excludes registers).
+        """
+        b, l = text.shape
+        valid = self._valid_mask(text, attention_mask)
+        if self.cfg.attention_mode == "causal":
+            return True, None, valid
+        key_valid = valid
+        if num_prefix:
+            key_valid = torch.cat([valid.new_ones(b, num_prefix), valid], dim=1)
+        attn_mask = torch.zeros((b, 1, 1, l + num_prefix), device=text.device, dtype=dtype)
+        attn_mask.masked_fill_(~key_valid[:, None, None, :], torch.finfo(dtype).min)
+        return False, attn_mask, valid
+
+    def get_cast_dtype(self) -> torch.dtype:
+        return self.blocks[0].get_weight_dtype() if self.blocks else self.token_embedding.weight.dtype
+
+    def set_grad_checkpointing(self, enable: bool = True, impl: str = "inline"):
+        if impl == "composable" and enable:
+            from torch.distributed._composable import checkpoint as composable_checkpoint
+            for block in self.blocks:
+                composable_checkpoint(block)
+        else:
+            self.grad_checkpointing = enable
+
+    def layer_groups(self, pooler_in_head: bool = True):
+        embed = [self.token_embedding]
+        if self.reg_tokens is not None:
+            embed.append(self.reg_tokens)
+        if not isinstance(self.norm_pre, nn.Identity):
+            embed.append(self.norm_pre)
+        groups = [("embeddings", embed)]
+        n = len(self.blocks)
+        for i, block in enumerate(self.blocks):
+            members = [block]
+            if i == n - 1:
+                members.append(self.ln_final)
+                if not pooler_in_head:
+                    members.append(self.pool)
+            groups.append((f"layer.{i}", members))
+        head = []
+        if pooler_in_head:
+            head.append(self.pool)
+        if self.text_projection is not None:
+            head.append(self.text_projection)
+        if head:
+            groups.append(("proj", head))
+        return groups
+
+    def lock(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True, pooler_in_head: bool = True):
+        assert freeze_layer_norm, 'Unfreezing normalization layers is not supported.'
+        _lock_layer_groups(self.layer_groups(pooler_in_head), unlocked_layers)
+
+    def no_weight_decay(self):
+        # Learned token-like params follow the positional_embedding / cls_emb convention: excluded from decay
+        # (registers and the MAP pool's query latent); the 1-D rule already covers norms, biases, and scalars.
+        no_wd = set()
+        if self.reg_tokens is not None:
+            no_wd.add("reg_tokens")
+        if getattr(self.pool, "query", None) is not None:
+            no_wd.add("pool.query")
+        return no_wd
+
+    def _encode_tokens(
+            self,
+            text: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            take_indices: Optional[List[int]] = None,
+            stop_index: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Run the block stack, returning ``(x, valid, intermediates)`` with ``x`` pre-``ln_final``.
+
+        ``x`` (and collected intermediates) include the ``num_reg`` register prefix when configured; ``valid``
+        covers the text positions only. ``take_indices`` collects raw block outputs for
+        ``forward_intermediates``; ``stop_index`` truncates the stack (early exit) when only intermediates are
+        needed.
+        """
+        cast_dtype = self.get_cast_dtype()
+        x = self.token_embedding(text).to(cast_dtype)
+        if self.reg_tokens is not None:
+            x = torch.cat([self.reg_tokens.to(x.dtype).expand(x.shape[0], -1, -1), x], dim=1)
+        x = self.norm_pre(x)
+        is_causal, attn_mask, valid = self._attn_inputs(
+            text, x.dtype, num_prefix=self.num_reg, attention_mask=attention_mask)
+        rope_embed = self.rope(x.shape[1], x.device, x.dtype) if self.rope is not None else None
+        blocks = self.blocks if stop_index is None else self.blocks[:stop_index + 1]
+        intermediates = []
+        v_first = None
+        for i, block in enumerate(blocks):
+            if self.grad_checkpointing:
+                x, v_first = checkpoint(block, x, rope_embed, attn_mask, is_causal, v_first, use_reentrant=False)
+            else:
+                x, v_first = block(
+                    x, rope_embed=rope_embed, attn_mask=attn_mask, is_causal=is_causal, v_first=v_first,
+                )
+            if take_indices is not None and i in take_indices:
+                intermediates.append(x)
+        return x, valid, intermediates
+
+    def forward_intermediates(
+            self,
+            text: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            indices: Optional[Union[int, List[int]]] = None,
+            stop_early: bool = False,
+            normalize_intermediates: bool = False,
+            intermediates_only: bool = False,
+            output_fmt: str = 'NLC',
+            output_extra_tokens: bool = False,
+    ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor]]]:
+        assert output_fmt == 'NLC', 'ModernTextTransformer only supports NLC text intermediates.'
+        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
+        x, valid, intermediates = self._encode_tokens(
+            text,
+            attention_mask=attention_mask,
+            take_indices=take_indices,
+            stop_index=max_index if stop_early else None,
+        )
+        if normalize_intermediates:
+            intermediates = [self.ln_final(t) for t in intermediates]
+        # Split the register prefix out of the intermediates: text positions under the usual key, registers
+        # (the only "extra" tokens this tower has) under the extra key when requested.
+        extra = []
+        if self.num_reg:
+            extra = [t[:, :self.num_reg] for t in intermediates]
+            intermediates = [t[:, self.num_reg:] for t in intermediates]
+
+        output = {"text_intermediates": intermediates}
+        if output_extra_tokens:
+            output["text_intermediates_extra"] = extra
+        if intermediates_only:
+            return output
+
+        x = self.ln_final(x)
+        pooled = self.pool(x[:, self.num_reg:] if self.num_reg else x, text=text, valid=valid, eos_id=self.eos_id)
+        if self.text_projection is not None:
+            pooled = self.text_projection(pooled)
+        output["text_features"] = pooled
+        return output
+
+    def forward(self, text: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        x, valid, _ = self._encode_tokens(text, attention_mask=attention_mask)
+        x = self.ln_final(x)
+        tokens = x[:, self.num_reg:] if self.num_reg else x
+        pooled = self.pool(tokens, text=text, valid=valid, eos_id=self.eos_id)
+        if self.text_projection is not None:
+            pooled = self.text_projection(pooled)
+        if self.cfg.output_tokens:
+            # NOTE: tokens cover the text positions (registers stripped) but pad positions are NOT masked --
+            # consumers of per-token features must mask via `text != pad_id`, like the pooling here does.
+            return pooled, tokens
+        return pooled
 
 
 class TextTransformer(nn.Module):
@@ -998,6 +1771,7 @@ class TextTransformer(nn.Module):
             use_pad_mask: bool = False,
             correct_cls_mask: bool = False,
             pad_id: int = 0,
+            bos_id: Optional[int] = None,
             eos_id: int = 2,
             pool_type: str = 'argmax',
             proj_type: str = 'linear',
@@ -1022,9 +1796,18 @@ class TextTransformer(nn.Module):
         self.output_dim = output_dim
         self.heads = heads
         self.pad_id = pad_id
+        self.bos_id = bos_id
         self.eos_id = eos_id
         self.pool_type = pool_type
         self.use_pad_mask = use_pad_mask and no_causal_mask  # only use in bi‑dir mode
+        if use_pad_mask and not no_causal_mask and not embed_cls:
+            # with embed_cls (CoCa) the cls-additive mask includes pad masking regardless, so the
+            # flag is only truly dropped for a plain causal tower
+            warnings.warn(
+                "text_cfg.use_pad_mask=True is ignored for causal text towers (right padding is "
+                "already unreachable under the causal mask); it only applies with no_causal_mask=True.",
+                UserWarning,
+            )
         self.correct_cls_mask = correct_cls_mask  # use the correct cls mask for CoCa (original is wrong)
 
         self.token_embedding = nn.Embedding(vocab_size, width)
@@ -1093,16 +1876,24 @@ class TextTransformer(nn.Module):
     def set_grad_checkpointing(self, enable: bool = True, impl: str = 'inline'):
         self.transformer.set_grad_checkpointing(enable, impl=impl)
 
-    def lock(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True):
+    def layer_groups(self, pooler_in_head: bool = True):
+        """Ordered, complete partition into named ``(name, [members])`` groups, shared by ``lock`` and layer-wise
+        LR decay. See :func:`_text_layer_groups`. ``pooler_in_head`` is accepted for a common signature with the HF
+        text tower but has no effect here (the native tower has no readout pooler).
+        """
+        return _text_layer_groups(self, pooler_in_head)
+
+    def lock(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True, pooler_in_head: bool = True):
         """
         Lock the text transformer layers, optionally leaving some layers unlocked.
 
         Args:
             unlocked_layers: Number of layers to leave unlocked (from the end).
             freeze_layer_norm: LayerNorm freeze (only for API compatibility, not functional)
+            pooler_in_head: pooler placement policy (no effect for the native tower; kept for a common signature).
         """
         assert freeze_layer_norm, 'Unfreezing LayerNorm is not supported. LayerNorm treated like other weights.'
-        lock_text_tower(self, unlocked_layers)
+        lock_text_tower(self, unlocked_layers, pooler_in_head)
 
     def no_weight_decay(self):
         # for timm optimizers, 1d params like logit_scale, logit_bias, ln/bn scale, biases are excluded by default
@@ -1112,24 +1903,23 @@ class TextTransformer(nn.Module):
         return no_wd
 
     def build_causal_mask(self):
-        # lazily create causal attention mask, with full attention between the tokens
-        # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(self.num_pos, self.num_pos)
-        mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
-        return mask
+        return _build_causal_mask(self.num_pos)
 
     def _build_additive_mask(
         self,
         text: torch.Tensor,  # [B, L] – original text ids without CLS yet
         seq_len: int,  # L (+1 if CLS added)
         dtype: torch.dtype,
+        attention_mask: Optional[torch.Tensor] = None,  # [B, L] bool/int, True/1 = real token
     ) -> torch.Tensor:
         """
         Returns an additive (-inf) mask of shape [B*heads, seq_len, seq_len] that
         simultaneously masks padding tokens and (optionally) the CLS token.
         """
-        valid = text != self.pad_id  # [B, L] (True = keep)
+        if attention_mask is not None:
+            valid = attention_mask.bool()  # [B, L] (True = keep), data-layer provided
+        else:
+            valid = text != self.pad_id  # [B, L] (True = keep), pad-value fallback
 
         if self.cls_emb is not None:
             cls_valid = valid.new_ones(valid.size(0), 1) # [B, 1]
@@ -1143,7 +1933,7 @@ class TextTransformer(nn.Module):
         additive = additive.repeat_interleave(self.heads, 0)  # [B*H, Q, K]
         return additive
 
-    def _embeds(self, text) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _embeds(self, text, attention_mask=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         cast_dtype = self.transformer.get_cast_dtype()
         B, seq_len = text.shape
 
@@ -1155,13 +1945,14 @@ class TextTransformer(nn.Module):
             seq_len += 1
 
         attn_mask = self.attn_mask  # Base causal mask (if any)
+        if attn_mask is not None:
+            attn_mask = attn_mask[:seq_len, :seq_len]
 
         # Class + padding additive mask
         if self.use_pad_mask or self.cls_emb is not None:
-            add_mask  = self._build_additive_mask(text, seq_len, x.dtype)
+            add_mask = self._build_additive_mask(text, seq_len, x.dtype, attention_mask=attention_mask)
             if attn_mask is not None:
-                # Slice the causal mask to match current sequence length
-                attn_mask = attn_mask[:seq_len, :seq_len].unsqueeze(0) + add_mask
+                attn_mask = attn_mask.unsqueeze(0) + add_mask
             else:
                 attn_mask = add_mask
 
@@ -1171,6 +1962,7 @@ class TextTransformer(nn.Module):
     def forward_intermediates(
             self,
             text: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
             indices: Optional[Union[int, List[int]]] = None,
             stop_early: bool = False,
             normalize_intermediates: bool = False,
@@ -1182,6 +1974,7 @@ class TextTransformer(nn.Module):
 
         Args:
             text: Input text ids
+            attention_mask: Optional [B, L] bool/int validity (True/1 = real token); pad-value fallback when absent
             indices: Take last n blocks if int, all if None, select matching indices if sequence
             stop_early: Stop iterating over blocks when last desired intermediate hit
             normalize_intermediates: Apply norm layer to all intermediates
@@ -1193,7 +1986,7 @@ class TextTransformer(nn.Module):
         """
         assert output_fmt in ('NLC',), 'Output format must be NLC.'
         # forward pass
-        x, attn_mask = self._embeds(text)
+        x, attn_mask = self._embeds(text, attention_mask=attention_mask)
         x, intermediates = self.transformer.forward_intermediates(
             x,
             attn_mask=attn_mask,
@@ -1253,8 +2046,8 @@ class TextTransformer(nn.Module):
             self.text_projection = None
         return take_indices
 
-    def forward(self, text):
-        x, attn_mask = self._embeds(text)
+    def forward(self, text, attention_mask=None):
+        x, attn_mask = self._embeds(text, attention_mask=attention_mask)
 
         x = self.transformer(x, attn_mask=attn_mask)
 
@@ -1281,6 +2074,58 @@ class TextTransformer(nn.Module):
         return pooled
 
 
+def context_attn_mask_from_valid(context_valid: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """[B, L_ctx] bool/int validity (True/1 = real K/V token) -> SDPA bool mask [B, 1, 1, L_ctx].
+
+    SDPA accepts bool (True = attend) or float additive masks; validity passes straight through as
+    bool. Broadcastable against [B, H, L_q, L_ctx] attention on both the modern SDPA path and the
+    classic ``Attention`` module (bool and additive handled there too)."""
+    if context_valid is None:
+        return None
+    valid = context_valid.bool()
+    # branchless all-invalid guard: a fully masked row yields NaN attention on fused SDPA
+    # backends -- force one valid position instead (same policy as the decoders' _valid_mask)
+    empty = ~valid.any(dim=1, keepdim=True)
+    first = torch.zeros_like(valid)
+    first[:, 0] = True
+    valid = valid | (empty & first)
+    return valid[:, None, None, :]
+
+
+def _init_classic_resblocks(
+        blocks: Sequence[ResidualAttentionBlock],
+        width: int,
+        layers: int,
+):
+    """Initialize every parameter owned by classic self/cross-attention residual blocks."""
+    proj_std = (width ** -0.5) * ((2 * layers) ** -0.5)
+    attn_std = width ** -0.5
+    fc_std = (2 * width) ** -0.5
+    for block in blocks:
+        attn = block.attn
+        if attn.in_proj_weight is not None:
+            nn.init.normal_(attn.in_proj_weight, std=attn_std)
+        else:
+            nn.init.normal_(attn.q_proj_weight, std=attn_std)
+            nn.init.normal_(attn.k_proj_weight, std=attn_std)
+            nn.init.normal_(attn.v_proj_weight, std=attn_std)
+        if attn.in_proj_bias is not None:
+            nn.init.zeros_(attn.in_proj_bias)
+        if attn.logit_scale is not None:
+            nn.init.constant_(attn.logit_scale, math.log(10))
+        if attn.head_scale is not None:
+            nn.init.ones_(attn.head_scale)
+        nn.init.normal_(attn.out_proj.weight, std=proj_std)
+        if attn.out_proj.bias is not None:
+            nn.init.zeros_(attn.out_proj.bias)
+        nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+        if block.mlp.c_fc.bias is not None:
+            nn.init.zeros_(block.mlp.c_fc.bias)
+        nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        if block.mlp.c_proj.bias is not None:
+            nn.init.zeros_(block.mlp.c_proj.bias)
+
+
 class MultimodalTransformer(Transformer):
     def __init__(
             self,
@@ -1304,6 +2149,8 @@ class MultimodalTransformer(Transformer):
             norm_layer=norm_layer,
         )
         self.context_length = context_length
+        self.output_dim = output_dim
+        self.vocab_size = output_dim
         self.cross_attn = nn.ModuleList([
             ResidualAttentionBlock(
                 width,
@@ -1322,31 +2169,25 @@ class MultimodalTransformer(Transformer):
         self.ln_final = norm_layer(width)
         self.text_projection = nn.Parameter(torch.empty(width, output_dim))
 
+        self.init_parameters()
+
     def init_parameters(self):
-        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        attn_std = self.transformer.width ** -0.5
-        fc_std = (2 * self.transformer.width) ** -0.5
-        for block in self.transformer.resblocks:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
-        for block in self.transformer.cross_attn:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        _reset_submodule_parameters(self)
+        _init_classic_resblocks(
+            list(self.resblocks) + list(self.cross_attn),
+            width=self.width,
+            layers=self.layers,
+        )
 
         if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+            nn.init.normal_(self.text_projection, std=self.width ** -0.5)
+
+        if self.attn_mask is not None:
+            mask = self.build_attention_mask().to(device=self.attn_mask.device, dtype=self.attn_mask.dtype)
+            self.attn_mask.copy_(mask)
 
     def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the tokens
-        # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(self.context_length, self.context_length)
-        mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
-        return mask
+        return _build_causal_mask(self.context_length)
 
     def forward_intermediates(
             self,
@@ -1357,13 +2198,23 @@ class MultimodalTransformer(Transformer):
     ):
         assert False, "Not currently implemented for MultimodalTransformer w/ xattn"
 
-    def forward(self, image_embs, text_embs):
+    @property
+    def lm_head_params(self):
+        # CoCa builds this tower with output_dim=vocab_size, so text_projection IS the vocab head.
+        # (weight, bias) in F.linear convention ([vocab, width]) for the fused caption-loss path.
+        return self.text_projection.t(), None
+
+    def forward(self, context, text_embs, context_valid=None, return_hidden: bool = False):
+        """context: [B, L_ctx, D] cross-attention K/V tokens (modality-agnostic; the caller names the
+        modality). context_valid: optional [B, L_ctx] bool/int, True/1 = real token -- masks padded
+        context keys (e.g. NaFlex patch batches)."""
         # TODO(kv-cache): Accept past_key_values (list of (K, V) per layer)
         # and cache_position. When past_key_values is not None, only process
         # new positions for self-attention (concatenate past K/V).
-        # Cross-attention K/V from image_embs are constant per generation and
+        # Cross-attention K/V from context are constant per generation and
         # can be cached once.
         seq_len = text_embs.shape[1]
+        context_attn_mask = context_attn_mask_from_valid(context_valid)
 
         for resblock, cross_attn in zip(self.resblocks, self.cross_attn):
             if self.grad_checkpointing:
@@ -1371,12 +2222,15 @@ class MultimodalTransformer(Transformer):
                 text_embs = checkpoint(
                     resblock, text_embs, None, None, self.attn_mask[:seq_len, :seq_len], use_reentrant=False)
                 text_embs = checkpoint(
-                    cross_attn, text_embs, image_embs, image_embs, None, use_reentrant=False)
+                    cross_attn, text_embs, context, context, context_attn_mask, use_reentrant=False)
             else:
                 text_embs = resblock(text_embs, attn_mask=self.attn_mask[:seq_len, :seq_len])
-                text_embs = cross_attn(text_embs, k_x=image_embs, v_x=image_embs)
+                text_embs = cross_attn(text_embs, k_x=context, v_x=context, attn_mask=context_attn_mask)
 
         out = self.ln_final(text_embs)
+        if return_hidden:
+            # pre-head hidden for the fused caption loss (pairs with lm_head_weight/bias)
+            return out
         if self.text_projection is not None:
             out = out @ self.text_projection
 
@@ -1393,99 +2247,716 @@ class MultimodalTransformer(Transformer):
             self.grad_checkpointing = enable
 
 
-def lock_text_tower(
-    model: nn.Module,
-    unlocked_layers: int = 0,
-):
-    """
-    Lock text tower layers for CLIP models.
+class MultimodalDecoder(nn.Module):
+    """MaMMUT-style text decoder, one tower used in two explicit passes.
 
-    Works with both model architectures:
-    - CustomTextCLIP where text components are in self.text
-    - Standard CLIP where text components are unpacked as attributes
+    A single decoder serves both MaMMUT (https://arxiv.org/abs/2303.16839) objectives:
+
+    * ``mode='contrastive'``: bi-directional self-attention (pad tokens masked from
+      attention when ``use_pad_mask``), cross-attention skipped. Returns a pooled text
+      embedding, mean over non-pad tokens (``pool_type='avg'``) or over all positions
+      including pads (``'avg_all'``, matches original LAION MaMMUT weights), passed
+      through an optional projection.
+    * ``mode='caption'``: causal self-attention with cross-attention over image token
+      embeddings after every ``cross_attn_ratio``'th layer. Returns full-length vocab
+      logits via ``lm_head``; the caller applies the autoregressive shift for LM loss.
+
+    The pass is always selected explicitly by the caller, never inferred from the
+    presence of image embeddings.
+    """
+
+    def __init__(
+            self,
+            context_length: int = 77,
+            vocab_size: int = 49408,
+            width: int = 512,
+            heads: int = 8,
+            layers: int = 12,
+            mlp_ratio: float = 4.0,
+            ls_init_value: float = None,
+            cross_attn_ratio: int = 1,
+            output_dim: Optional[int] = 512,
+            proj_type: str = 'none',
+            pool_type: str = 'avg',
+            use_pad_mask: bool = True,
+            pad_id: int = 0,
+            bos_id: Optional[int] = None,
+            eos_id: Optional[int] = None,
+            act_layer: Type[nn.Module] = nn.GELU,
+            norm_layer: Type[nn.Module] = LayerNorm,
+    ):
+        super().__init__()
+        assert pool_type in ('avg', 'avg_all')
+        assert 1 <= cross_attn_ratio <= layers
+        self.context_length = context_length
+        self.vocab_size = vocab_size
+        self.width = width
+        self.heads = heads
+        self.layers = layers
+        self.pad_id = pad_id
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+        self.pool_type = pool_type
+        self.use_pad_mask = use_pad_mask
+        self.grad_checkpointing = False
+
+        # cross-attention after self-attention layer i when i % cross_attn_ratio == 0, i.e. layers
+        # 0, 2, 4, ... for cross_attn_ratio=2 (matches LAION MaMMUT); for non-divisors the trailing
+        # group is simply shorter (layers=12, ratio=5 -> cross-attn after layers 0, 5, 10)
+        self.cross_step = cross_attn_ratio
+
+        self.token_embedding = nn.Embedding(vocab_size, width)
+        self.positional_embedding = nn.Parameter(torch.empty(context_length, width))
+        self.resblocks = nn.ModuleList([
+            ResidualAttentionBlock(
+                width,
+                heads,
+                mlp_ratio,
+                ls_init_value=ls_init_value,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+            )
+            for _ in range(layers)
+        ])
+        self.cross_attn = nn.ModuleList([
+            ResidualAttentionBlock(
+                width,
+                heads,
+                mlp_ratio,
+                ls_init_value=ls_init_value,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                is_cross_attention=True,
+            )
+            for i in range(layers) if i % self.cross_step == 0
+        ])
+        self.ln_final = norm_layer(width)
+        self.lm_head = nn.Parameter(torch.empty(width, vocab_size))
+        if proj_type == 'none' or not output_dim:
+            self.text_projection = None
+        else:
+            self.text_projection = nn.Parameter(torch.empty(width, output_dim))
+
+        self.register_buffer('attn_mask', self.build_causal_mask(), persistent=False)
+
+        self.init_parameters()
+
+    def init_parameters(self):
+        _reset_submodule_parameters(self)
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+        nn.init.normal_(self.positional_embedding, std=0.01)
+        _init_classic_resblocks(
+            list(self.resblocks) + list(self.cross_attn),
+            width=self.width,
+            layers=self.layers,
+        )
+
+        nn.init.normal_(self.lm_head, std=self.width ** -0.5)
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection, std=self.width ** -0.5)
+        if self.attn_mask is not None:
+            mask = self.build_causal_mask().to(device=self.attn_mask.device, dtype=self.attn_mask.dtype)
+            self.attn_mask.copy_(mask)
+
+    def build_causal_mask(self):
+        return _build_causal_mask(self.context_length)
+
+    def _valid_mask(self, text: torch.Tensor, text_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return _text_valid_mask(text, self.pad_id, text_valid)
+
+    def _build_pad_mask(self, valid: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Additive (-inf) key mask of shape [B*heads, L, L] hiding invalid (pad) tokens."""
+        key_mask = valid.unsqueeze(1).expand(-1, valid.shape[1], -1)  # [B, Q, K]
+        additive = torch.zeros_like(key_mask, dtype=dtype)
+        additive.masked_fill_(~key_mask, float("-inf"))
+        additive = additive.repeat_interleave(self.heads, 0)  # [B*H, Q, K]
+        return additive
+
+    def get_cast_dtype(self) -> torch.dtype:
+        return self.resblocks[0].get_weight_dtype()
+
+    def no_weight_decay(self):
+        # for timm optimizers, 1d params like logit_scale, logit_bias, ln/bn scale, biases are excluded by default
+        return {'positional_embedding'}
+
+    @property
+    def lm_head_params(self):
+        # (weight, bias) in F.linear convention ([vocab, width]) for the fused caption-loss path.
+        return self.lm_head.t(), None
+
+    def forward(
+            self,
+            text: torch.Tensor,
+            text_valid: Optional[torch.Tensor] = None,
+            context: Optional[torch.Tensor] = None,
+            context_valid: Optional[torch.Tensor] = None,
+            mode: str = 'caption',
+            return_hidden: bool = False,
+    ):
+        """text_valid: optional [B, L] bool/int, True/1 = real token (HF polarity). Consumed by the
+        contrastive pass (attention key mask + masked mean pool); the caption pass is causal over
+        right-padded text so it never needs one. Legacy configs (pool_type='avg_all',
+        use_pad_mask=False) ignore it entirely, preserving original openMaMMUT numerics. When absent,
+        validity falls back to ``text != pad_id``.
+
+        context / context_valid: [B, L_ctx, D] cross-attention K/V tokens and their optional
+        [B, L_ctx] validity (True/1 = real) -- modality-agnostic; the caller names the modality."""
+        if mode == 'caption':
+            assert context is not None, 'context tokens are required for the caption pass'
+        elif mode == 'contrastive':
+            assert context is None and context_valid is None, \
+                'the contrastive pass does not cross-attend, do not pass context/context_valid'
+        else:
+            raise ValueError(f'Unknown mode {mode!r}, expected "contrastive" or "caption"')
+
+        seq_len = text.shape[1]
+        cast_dtype = self.get_cast_dtype()
+        x = self.token_embedding(text).to(cast_dtype)
+        x = x + self.positional_embedding[:seq_len].to(cast_dtype)
+
+        valid = None
+        if mode == 'caption':
+            attn_mask = self.attn_mask[:seq_len, :seq_len]
+        else:
+            if self.use_pad_mask or self.pool_type == 'avg':
+                valid = self._valid_mask(text, text_valid)
+            attn_mask = self._build_pad_mask(valid, x.dtype) if self.use_pad_mask else None
+        context_attn_mask = context_attn_mask_from_valid(context_valid)
+
+        for idx, resblock in enumerate(self.resblocks):
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(resblock, x, attn_mask=attn_mask, use_reentrant=False)
+            else:
+                x = resblock(x, attn_mask=attn_mask)
+            if mode == 'caption' and idx % self.cross_step == 0:
+                cross_attn = self.cross_attn[idx // self.cross_step]
+                if self.grad_checkpointing and not torch.jit.is_scripting():
+                    x = checkpoint(
+                        cross_attn, x, k_x=context, v_x=context, attn_mask=context_attn_mask, use_reentrant=False)
+                else:
+                    x = cross_attn(x, k_x=context, v_x=context, attn_mask=context_attn_mask)
+
+        x = self.ln_final(x)
+
+        if mode == 'contrastive':
+            pooled = text_global_pool(
+                x,
+                text,
+                pool_type='avg',
+                valid=valid if self.pool_type == 'avg' else None,
+            )
+            if self.text_projection is not None:
+                pooled = pooled @ self.text_projection
+            return pooled
+
+        if return_hidden:
+            # pre-head hidden for the fused caption loss (pairs with lm_head_params)
+            return x
+        return x @ self.lm_head
+
+    def set_grad_checkpointing(self, enable: bool = True, impl: str = 'inline'):
+        if impl == 'composable' and enable:
+            from torch.distributed._composable import checkpoint as composable_checkpoint
+            for resblock in self.resblocks:
+                composable_checkpoint(resblock)
+            for cross_attn in self.cross_attn:
+                composable_checkpoint(cross_attn)
+        else:
+            self.grad_checkpointing = enable
+
+
+class ModernMultimodalDecoder(nn.Module):
+    """Modern-arch MaMMUT text decoder: ModernTextTransformer features (RoPE, SwiGLU/ReLU^2,
+    RMSNorm, qk-norm, gated attention, sandwich norms, value residuals) with cross-attention
+    sublayers folded into every ``cross_attn_ratio``'th block (self-attn -> cross-attn -> MLP).
+
+    Same explicit two-pass contract as :class:`MultimodalDecoder`:
+
+    * ``mode='contrastive'``: bi-directional self-attention with pad keys masked, cross-attention
+      skipped. Returns a pooled text embedding via :class:`ModernTextPool` ('mean' masked mean by
+      default; 'eos' / 'map' also supported) and optional projection.
+    * ``mode='caption'``: causal self-attention (``is_causal`` fast path, no mask tensor -- right
+      padding + causal attention keep pads out of real positions, and pad logits are ignored by
+      the loss), cross-attention over projected image tokens. Returns full-length vocab logits
+      via ``lm_head`` (optionally weight-tied to the token embedding via ``cfg.tie_lm_head``).
+    """
+
+    def __init__(
+            self,
+            cfg: Any,
+            output_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        # 'avg' (MultimodalCfg default) and legacy 'argmax' map onto the modern pool equivalents;
+        # 'avg_all' is the classic-decoder legacy mode and has no modern weights to be compatible with.
+        pool_map = {'avg': 'mean', 'argmax': 'eos'}
+        pool_type = pool_map.get(cfg.pool_type, cfg.pool_type)
+        if pool_type not in ('mean', 'eos', 'map'):
+            raise ValueError(
+                f"modern multimodal decoder pool_type={cfg.pool_type!r} not supported "
+                f"(use 'avg'/'mean', 'eos', or 'map')."
+            )
+        if pool_type == 'eos' and cfg.eos_id is None:
+            raise ValueError("modern multimodal decoder 'eos' pooling requires multimodal_cfg.eos_id.")
+        if getattr(cfg, 'reg_tokens', 0):
+            raise ValueError("reg_tokens are not supported for the modern multimodal decoder.")
+        if getattr(cfg, 'use_pad_mask', True) is False:
+            # the classic MultimodalDecoder honors use_pad_mask=False as the legacy openMaMMUT mode;
+            # there are no legacy modern weights, so the modern decoder always masks invalid keys in
+            # the contrastive pass rather than accepting a silently-ignored flag
+            warnings.warn(
+                "multimodal_cfg.use_pad_mask=False is ignored by the modern multimodal decoder "
+                "(the contrastive pass always masks invalid keys); it only applies to the classic "
+                "decoder's legacy mode.",
+                UserWarning,
+            )
+        if cfg.pos_embed not in ("rope", "none", ""):
+            raise ValueError(f"unknown modern text pos_embed={cfg.pos_embed!r}")
+        if cfg.width % cfg.heads != 0:
+            raise ValueError(f"modern text width ({cfg.width}) must be divisible by heads ({cfg.heads}).")
+        if cfg.pos_embed == "rope" and (cfg.width // cfg.heads) % 2 != 0:
+            raise ValueError(
+                f"modern text RoPE head dim must be even, got width / heads = {cfg.width // cfg.heads}."
+            )
+
+        self.context_length = cfg.context_length
+        self.num_pos = cfg.context_length
+        self.vocab_size = cfg.vocab_size
+        self.width = cfg.width
+        self.layers = cfg.layers
+        self.output_dim = output_dim
+        self.pad_id = cfg.pad_id
+        self.bos_id = cfg.bos_id
+        self.eos_id = cfg.eos_id
+        self.grad_checkpointing = False
+
+        # cross-attention sublayer in block i when i % cross_attn_ratio == 0 (same placement as the
+        # classic MultimodalDecoder: blocks 0, 2, 4, ... for cross_attn_ratio=2)
+        cross_attn_ratio = getattr(cfg, 'cross_attn_ratio', 1)
+        assert 1 <= cross_attn_ratio <= cfg.layers
+        self.cross_step = cross_attn_ratio
+
+        norm_type = cfg.norm_type if cfg.norm_type is not None else "rmsnorm"
+        if norm_type == "rmsnorm":
+            norm_layer = lambda dim: nn.RMSNorm(dim, eps=cfg.norm_eps)
+        elif norm_type == "layernorm":
+            norm_layer = lambda dim: LayerNorm(dim, eps=cfg.norm_eps)
+        else:
+            raise ValueError(f"unknown modern text norm_type={norm_type!r}")
+
+        # NOTE: no padding_idx on the embedding (unlike ModernTextTransformer) -- pad_id is only a
+        # fallback fill convention here and may collide with a real vocab token (SimpleTokenizer id 0);
+        # a padding_idx would zero-freeze that token's embedding. Validity comes from attention_mask.
+        self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.width)
+        self.rope = RotaryEmbedding1D(
+            cfg.width // cfg.heads,
+            temperature=cfg.rope_temperature,
+        ) if cfg.pos_embed == "rope" else None
+        self.norm_pre = norm_layer(cfg.width) if getattr(cfg, "pre_norm", False) else nn.Identity()
+        # bias tri-states resolve as in ModernTextTransformer (None -> off for modern arch)
+        attention_bias = bool(getattr(cfg, "attention_bias", None))
+        mlp_bias = bool(getattr(cfg, "mlp_bias", None))
+        gate_bias_cfg = getattr(cfg, "gate_bias", None)
+        gate_bias = attention_bias if gate_bias_cfg is None else bool(gate_bias_cfg)
+        self.blocks = nn.ModuleList([
+            ModernTextDecoderBlock(
+                cfg.width,
+                cfg.heads,
+                mlp_ratio=cfg.mlp_ratio,
+                norm_layer=norm_layer,
+                qk_norm=cfg.qk_norm,
+                attn_gated=cfg.attn_gated,
+                mlp_type=cfg.mlp_type,
+                norm_placement=getattr(cfg, "norm_placement", "pre"),
+                ls_init_value=cfg.ls_init_value,
+                value_residual=getattr(cfg, "value_residual", False),
+                vr_first=(i == 0),
+                attn_bias=attention_bias,
+                gate_bias=gate_bias,
+                mlp_bias=mlp_bias,
+                cross_attn=(i % self.cross_step == 0),
+            )
+            for i in range(cfg.layers)
+        ])
+        self.ln_final = norm_layer(cfg.width)
+        self.pool = ModernTextPool(
+            cfg.width,
+            pool_type=pool_type,
+            heads=cfg.heads,
+            norm_layer=norm_layer,
+            bias=attention_bias,
+            qk_norm=cfg.qk_norm,
+        )
+        self.text_projection = (
+            None
+            if cfg.proj_type == "none" or not output_dim
+            else nn.Linear(cfg.width, output_dim, bias=cfg.proj_bias)
+        )
+        self.lm_head = nn.Linear(cfg.width, cfg.vocab_size, bias=False)
+        self.tie_lm_head = bool(getattr(cfg, 'tie_lm_head', False))
+
+        self.init_parameters()
+
+        if self.tie_lm_head:
+            # after init so the shared weight keeps the embedding init (and stays tied through training)
+            self.lm_head.weight = self.token_embedding.weight
+
+    def init_parameters(self):
+        _reset_submodule_parameters(self)
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+
+        # same scheme as ModernTextTransformer.init_parameters (see comments there)
+        sandwich = getattr(self.cfg, "norm_placement", "pre") == "sandwich"
+        zero_residual = bool(getattr(self.cfg, "zero_init_residual", False))
+        attn_std = 0.02 if sandwich else self.width ** -0.5
+        fc_std = 0.02 if sandwich else (2 * self.width) ** -0.5
+        proj_std = 0.02 if sandwich else attn_std * ((2 * self.layers) ** -0.5)
+        swiglu_fc_std = fc_std if sandwich else fc_std * 1.22
+        for block in self.blocks:
+            _init_modern_text_block(
+                block,
+                attn_std=attn_std,
+                fc_std=fc_std,
+                proj_std=proj_std,
+                swiglu_fc_std=swiglu_fc_std,
+                zero_residual=zero_residual,
+            )
+
+        if getattr(self.pool, "query", None) is not None:
+            nn.init.normal_(self.pool.query, std=self.width ** -0.5)
+            nn.init.normal_(self.pool.q.weight, std=self.width ** -0.5)
+            if self.pool.q.bias is not None:
+                nn.init.zeros_(self.pool.q.bias)
+            nn.init.normal_(self.pool.kv.weight, std=self.width ** -0.5)
+            if self.pool.kv.bias is not None:
+                nn.init.zeros_(self.pool.kv.bias)
+
+        if self.text_projection is not None:
+            nn.init.normal_(self.text_projection.weight, std=self.width ** -0.5)
+            if self.text_projection.bias is not None:
+                nn.init.zeros_(self.text_projection.bias)
+
+        if not self.tie_lm_head:
+            nn.init.normal_(self.lm_head.weight, std=self.width ** -0.5)
+
+    def _valid_mask(self, text: torch.Tensor, text_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return _text_valid_mask(text, self.pad_id, text_valid)
+
+    def get_cast_dtype(self) -> torch.dtype:
+        return self.blocks[0].get_weight_dtype() if self.blocks else self.token_embedding.weight.dtype
+
+    def no_weight_decay(self):
+        no_wd = set()
+        if getattr(self.pool, "query", None) is not None:
+            no_wd.add("pool.query")
+        return no_wd
+
+    @property
+    def lm_head_params(self):
+        # (weight, bias) in F.linear convention for the fused caption-loss path (weight may be
+        # tied to token_embedding via tie_lm_head; the property returns whatever the head uses).
+        return self.lm_head.weight, self.lm_head.bias
+
+    def forward(
+            self,
+            text: torch.Tensor,
+            text_valid: Optional[torch.Tensor] = None,
+            context: Optional[torch.Tensor] = None,
+            context_valid: Optional[torch.Tensor] = None,
+            mode: str = 'caption',
+            return_hidden: bool = False,
+    ):
+        """text_valid: optional [B, L] bool/int, True/1 = real token (HF polarity). Consumed by the
+        contrastive pass (attention key bias + pooling); the caption pass is causal over right-padded
+        text so it never needs one. When absent, validity falls back to ``text != pad_id``.
+
+        context / context_valid: [B, L_ctx, D] cross-attention K/V tokens and their optional
+        [B, L_ctx] validity (True/1 = real) -- modality-agnostic; the caller names the modality."""
+        if mode == 'caption':
+            assert context is not None, 'context tokens are required for the caption pass'
+        elif mode == 'contrastive':
+            assert context is None and context_valid is None, \
+                'the contrastive pass does not cross-attend, do not pass context/context_valid'
+        else:
+            raise ValueError(f'Unknown mode {mode!r}, expected "contrastive" or "caption"')
+
+        cast_dtype = self.get_cast_dtype()
+        x = self.token_embedding(text).to(cast_dtype)
+        x = self.norm_pre(x)
+
+        valid = None
+        if mode == 'caption':
+            # right padding + causal masking keep pads out of real positions; skip the mask tensor
+            is_causal, attn_mask = True, None
+        else:
+            is_causal = False
+            valid = self._valid_mask(text, text_valid)
+            attn_mask = torch.zeros((text.shape[0], 1, 1, text.shape[1]), device=text.device, dtype=x.dtype)
+            attn_mask.masked_fill_(~valid[:, None, None, :], torch.finfo(x.dtype).min)
+        context_attn_mask = context_attn_mask_from_valid(context_valid)
+
+        rope_embed = self.rope(x.shape[1], x.device, x.dtype) if self.rope is not None else None
+        v_first = None
+        for block in self.blocks:
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x, v_first = checkpoint(
+                    block, x, rope_embed, attn_mask, is_causal, v_first, context, context_attn_mask,
+                    use_reentrant=False)
+            else:
+                x, v_first = block(
+                    x, rope_embed=rope_embed, attn_mask=attn_mask, is_causal=is_causal, v_first=v_first,
+                    context=context, context_attn_mask=context_attn_mask,
+                )
+
+        x = self.ln_final(x)
+
+        if mode == 'contrastive':
+            pooled = self.pool(x, text=text, valid=valid, eos_id=self.eos_id)
+            if self.text_projection is not None:
+                pooled = self.text_projection(pooled)
+            return pooled
+
+        if return_hidden:
+            # pre-head hidden for the fused caption loss (pairs with lm_head_params)
+            return x
+        return self.lm_head(x)
+
+    def set_grad_checkpointing(self, enable: bool = True, impl: str = 'inline'):
+        if impl == 'composable' and enable:
+            from torch.distributed._composable import checkpoint as composable_checkpoint
+            for block in self.blocks:
+                composable_checkpoint(block)
+        else:
+            self.grad_checkpointing = enable
+
+
+class ModernMultimodalTransformer(nn.Module):
+    """Modern-arch CoCa caption decoder -- the modern analog of :class:`MultimodalTransformer`,
+    as :class:`ModernMultimodalDecoder` is of MaMMUT's :class:`MultimodalDecoder`.
+
+    Consumes token *embeddings* from the unimodal text tower (post-``ln_final`` for
+    ModernTextTransformer -- a deliberate difference from classic CoCa, which feeds pre-norm
+    tokens): causal self-attention with RoPE, cross-attention over image tokens in every
+    ``cross_attn_ratio``'th block (default 1 = every block, matching classic CoCa), then
+    ``lm_head`` vocab logits over the full length (the task applies the AR shift). No token
+    embedding, pooling, or contrastive projection -- the contrastive readout lives in the
+    unimodal tower. Causal attention over right-padded text needs no validity mask; caption
+    label masking happens task-side.
+    """
+
+    def __init__(
+            self,
+            cfg: Any,
+            vocab_size: Optional[int] = None,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        if cfg.pos_embed not in ("rope", "none", ""):
+            raise ValueError(f"unknown modern text pos_embed={cfg.pos_embed!r}")
+        if cfg.width % cfg.heads != 0:
+            raise ValueError(f"modern text width ({cfg.width}) must be divisible by heads ({cfg.heads}).")
+        if cfg.pos_embed == "rope" and (cfg.width // cfg.heads) % 2 != 0:
+            raise ValueError(
+                f"modern text RoPE head dim must be even, got width / heads = {cfg.width // cfg.heads}."
+            )
+
+        self.context_length = cfg.context_length
+        self.vocab_size = vocab_size if vocab_size is not None else cfg.vocab_size
+        self.width = cfg.width
+        self.layers = cfg.layers
+        self.pad_id = cfg.pad_id
+        self.bos_id = cfg.bos_id
+        self.eos_id = cfg.eos_id
+        self.grad_checkpointing = False
+
+        cross_attn_ratio = getattr(cfg, 'cross_attn_ratio', 1)
+        assert 1 <= cross_attn_ratio <= cfg.layers
+        self.cross_step = cross_attn_ratio
+
+        norm_type = cfg.norm_type if cfg.norm_type is not None else "rmsnorm"
+        if norm_type == "rmsnorm":
+            norm_layer = lambda dim: nn.RMSNorm(dim, eps=cfg.norm_eps)
+        elif norm_type == "layernorm":
+            norm_layer = lambda dim: LayerNorm(dim, eps=cfg.norm_eps)
+        else:
+            raise ValueError(f"unknown modern text norm_type={norm_type!r}")
+
+        self.rope = RotaryEmbedding1D(
+            cfg.width // cfg.heads,
+            temperature=cfg.rope_temperature,
+        ) if cfg.pos_embed == "rope" else None
+        # bias tri-states resolve as in ModernTextTransformer (None -> off for modern arch)
+        attention_bias = bool(getattr(cfg, "attention_bias", None))
+        mlp_bias = bool(getattr(cfg, "mlp_bias", None))
+        gate_bias_cfg = getattr(cfg, "gate_bias", None)
+        gate_bias = attention_bias if gate_bias_cfg is None else bool(gate_bias_cfg)
+        self.blocks = nn.ModuleList([
+            ModernTextDecoderBlock(
+                cfg.width,
+                cfg.heads,
+                mlp_ratio=cfg.mlp_ratio,
+                norm_layer=norm_layer,
+                qk_norm=cfg.qk_norm,
+                attn_gated=cfg.attn_gated,
+                mlp_type=cfg.mlp_type,
+                norm_placement=getattr(cfg, "norm_placement", "pre"),
+                ls_init_value=cfg.ls_init_value,
+                value_residual=getattr(cfg, "value_residual", False),
+                vr_first=(i == 0),
+                attn_bias=attention_bias,
+                gate_bias=gate_bias,
+                mlp_bias=mlp_bias,
+                cross_attn=(i % self.cross_step == 0),
+            )
+            for i in range(cfg.layers)
+        ])
+        self.ln_final = norm_layer(cfg.width)
+        self.lm_head = nn.Linear(cfg.width, self.vocab_size, bias=False)
+
+        self.init_parameters()
+
+    def init_parameters(self):
+        _reset_submodule_parameters(self)
+        # same scheme as ModernTextTransformer.init_parameters (see comments there)
+        sandwich = getattr(self.cfg, "norm_placement", "pre") == "sandwich"
+        zero_residual = bool(getattr(self.cfg, "zero_init_residual", False))
+        attn_std = 0.02 if sandwich else self.width ** -0.5
+        fc_std = 0.02 if sandwich else (2 * self.width) ** -0.5
+        proj_std = 0.02 if sandwich else attn_std * ((2 * self.layers) ** -0.5)
+        swiglu_fc_std = fc_std if sandwich else fc_std * 1.22
+        for block in self.blocks:
+            _init_modern_text_block(
+                block,
+                attn_std=attn_std,
+                fc_std=fc_std,
+                proj_std=proj_std,
+                swiglu_fc_std=swiglu_fc_std,
+                zero_residual=zero_residual,
+            )
+        nn.init.normal_(self.lm_head.weight, std=self.width ** -0.5)
+
+    def get_cast_dtype(self) -> torch.dtype:
+        return self.blocks[0].get_weight_dtype() if self.blocks else self.lm_head.weight.dtype
+
+    @property
+    def lm_head_params(self):
+        # (weight, bias) in F.linear convention for the fused caption-loss path.
+        return self.lm_head.weight, self.lm_head.bias
+
+    def forward(
+            self,
+            context: torch.Tensor,
+            text_embs: torch.Tensor,
+            context_valid: Optional[torch.Tensor] = None,
+            return_hidden: bool = False,
+    ) -> torch.Tensor:
+        # (context, text_embs) argument order matches MultimodalTransformer / the CoCa call site.
+        # context_valid: optional [B, L_ctx] bool/int, True/1 = real token -- masks padded context keys.
+        x = text_embs
+        context_attn_mask = context_attn_mask_from_valid(context_valid)
+        rope_embed = self.rope(x.shape[1], x.device, x.dtype) if self.rope is not None else None
+        v_first = None
+        for block in self.blocks:
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x, v_first = checkpoint(
+                    block, x, rope_embed, None, True, v_first, context, context_attn_mask,
+                    use_reentrant=False)
+            else:
+                x, v_first = block(
+                    x, rope_embed=rope_embed, attn_mask=None, is_causal=True, v_first=v_first,
+                    context=context, context_attn_mask=context_attn_mask,
+                )
+        x = self.ln_final(x)
+        if return_hidden:
+            # pre-head hidden for the fused caption loss (pairs with lm_head_params)
+            return x
+        return self.lm_head(x)
+
+    def set_grad_checkpointing(self, enable: bool = True, impl: str = 'inline'):
+        if impl == 'composable' and enable:
+            from torch.distributed._composable import checkpoint as composable_checkpoint
+            for block in self.blocks:
+                composable_checkpoint(block)
+        else:
+            self.grad_checkpointing = enable
+
+
+def _text_layer_groups(module: nn.Module, pooler_in_head: bool = True):
+    """Ordered, complete partition of a native (CLIP) text tower into named ``(name, [members])`` groups.
+
+    Reads the duck-typed text attributes (``token_embedding``/``positional_embedding``/``cls_emb``,
+    ``transformer.resblocks``, ``ln_final``, ``text_projection``), so it works both for a ``TextTransformer`` and
+    for a standard CLIP that unpacks those attributes onto itself. Groups, input -> output: ``embeddings``,
+    ``layer.{i}`` (the final block is grouped with ``ln_final``), and ``proj`` (the projection head). The native
+    tower has no readout pooler, so ``pooler_in_head`` is accepted for a common signature but has no effect.
+    """
+    embed = [
+        m for m in (
+            getattr(module, "token_embedding", None),
+            getattr(module, "positional_embedding", None),
+            getattr(module, "cls_emb", None),
+        )
+        if m is not None
+    ]
+    groups = []
+    if embed:
+        groups.append(("embeddings", embed))
+    transformer = getattr(module, "transformer", None)
+    resblocks = transformer.resblocks if (transformer is not None and hasattr(transformer, "resblocks")) else []
+    ln_final = getattr(module, "ln_final", None)
+    n = len(resblocks)
+    for i, block in enumerate(resblocks):
+        layer_members = [block]
+        if (i == n - 1) and (ln_final is not None):
+            layer_members.append(ln_final)
+        groups.append((f"layer.{i}", layer_members))
+    text_projection = getattr(module, "text_projection", None)
+    if text_projection is not None:
+        groups.append(("proj", [text_projection]))
+    return groups
+
+
+def _set_group_requires_grad(members, requires_grad: bool):
+    """Set ``requires_grad`` on a group's members (a mix of ``nn.Module`` and ``nn.Parameter``)."""
+    for m in members:
+        if isinstance(m, nn.Parameter):
+            m.requires_grad = requires_grad
+        else:
+            for p in m.parameters():
+                p.requires_grad = requires_grad
+
+
+def _lock_layer_groups(groups, unlocked_layers: int = 0):
+    """Freeze layer groups bottom-up, leaving the top ``unlocked_layers`` groups trainable.
+
+    Sets every group explicitly (frozen -> False, unlocked -> True) so repeated calls with different counts are
+    idempotent (e.g. progressive unfreezing / multi-stage training). Shared by ``lock_text_tower`` and tower
+    ``lock`` methods so the freeze policy cannot drift between towers.
+    """
+    n_freeze = len(groups) if not unlocked_layers else len(groups) - unlocked_layers
+    for i, (_, members) in enumerate(groups):
+        _set_group_requires_grad(members, requires_grad=(i >= n_freeze))
+
+
+def lock_text_tower(
+        model: nn.Module,
+        unlocked_layers: int = 0,
+        pooler_in_head: bool = True,
+    ):
+    """Freeze a native (CLIP) text tower top-down, leaving the top ``unlocked_layers`` groups trainable.
+
+    Shares the ``_text_layer_groups`` enumeration with layer-wise LR decay, so freezing and decay agree on the
+    layer partition. ``unlocked_layers`` counts the top groups (the projection head first) left trainable, so
+    ``unlocked_layers=0`` freezes the whole tower. This is offset by one from layer-wise LR decay, which keeps
+    the head at lr_scale 1.0 (depth 0).
+
+    Works with both CustomTextCLIP (text components under ``model.text``) and standard CLIP (unpacked attributes).
 
     Args:
-        model: The CLIP model or TextTransformer module
-        unlocked_layers: Number of layers to leave unlocked (from the end)
+        model: the CLIP model or a ``TextTransformer``.
+        unlocked_layers: number of groups (from the output side, head first) to leave trainable; 0 freezes all.
+        pooler_in_head: pooler placement policy (no effect for the native tower; kept for a common signature).
     """
-    # Determine where to look for text components
-    if hasattr(model, 'text'):
-        # CustomTextCLIP or already a TextTransformer with nested structure
-        text_module = model.text
-    else:
-        # Standard CLIP or direct TextTransformer
-        text_module = model
-
-    # Collect text components
-    text_params = {}
-    text_params['token_embedding'] = getattr(text_module, 'token_embedding', None)
-    text_params['positional_embedding'] = getattr(text_module, 'positional_embedding', None)
-    text_params['cls_emb'] = getattr(text_module, 'cls_emb', None)
-    text_params['transformer'] = getattr(text_module, 'transformer', None)
-    text_params['ln_final'] = getattr(text_module, 'ln_final', None)
-    text_params['text_projection'] = getattr(text_module, 'text_projection', None)
-
-    # Filter out None values
-    text_params = {k: v for k, v in text_params.items() if v is not None}
-
-    # Freeze all text parameters first
-    for module in text_params.values():
-        if isinstance(module, nn.Parameter):
-            module.requires_grad = False
-        elif isinstance(module, nn.Module):
-            for param in module.parameters():
-                param.requires_grad = False
-
-    if unlocked_layers == 0:
-        return
-
-    # Check if we have transformer blocks to work with
-    transformer = text_params['transformer']
-    if not transformer or not hasattr(transformer, 'resblocks'):
-        return
-
-    total_layers = len(transformer.resblocks)
-    if total_layers == 0:
-        return
-
-    # Build groups for selective unlocking
-    groups = []
-
-    # Group 1: Embeddings
-    embedding_group = []
-    for key in ['token_embedding', 'positional_embedding', 'cls_emb']:
-        if key in text_params:
-            embedding_group.append(text_params[key])
-    if embedding_group:
-        groups.append(embedding_group)
-
-    # Group 2-N: Individual transformer blocks (except last)
-    if total_layers > 1:
-        for block in transformer.resblocks[:-1]:
-            groups.append([block])
-
-    # Combine last transformer block + final ln as the penultimate group
-    last_block = [transformer.resblocks[-1]]
-    if 'ln_final' in text_params:
-        last_block.append(text_params['ln_final'])
-    groups.append(last_block)
-
-    # The final group is the projection only
-    if 'text_projection' in text_params:
-        groups.append([text_params['text_projection']])
-
-    # Helper function to unlock parameters
-    def _unlock(module):
-        if isinstance(module, Sequence):
-            for m in module:
-                _unlock(m)
-        elif isinstance(module, nn.Parameter):
-            module.requires_grad = True
-        elif isinstance(module, nn.Module):
-            for name, param in module.named_parameters():
-                param.requires_grad = True
-
-    # Unlock the specified number of layer groups from the end
-    num_groups_to_unlock = min(unlocked_layers, len(groups))
-    for group in groups[-num_groups_to_unlock:]:
-        _unlock(group)
+    text_module = model.text if hasattr(model, "text") else model
+    _lock_layer_groups(_text_layer_groups(text_module, pooler_in_head), unlocked_layers)
