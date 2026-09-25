@@ -1,0 +1,22 @@
+{
+    "embed_dim": 512,
+    "vision_cfg": {
+        "image_size": 310,
+        "timm_model_name": "resnet34",
+        "timm_model_pretrained": false,
+        "timm_pool": "avg",
+        "timm_proj": "linear",
+        "timm_model_kwargs": {
+            "in_chans": 1
+        },
+        "timm_num_views": 2,
+        "timm_view_fusion": "concat"
+    },
+    "text_cfg": {
+        "context_length": 2560,
+        "vocab_size": 49408,
+        "width": 512,
+        "heads": 8,
+        "layers": 12
+    }
+}

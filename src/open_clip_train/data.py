@@ -1266,6 +1266,9 @@ def get_dataset_fn(data_path, dataset_type):
     elif dataset_type == "webdataset-audio":
         from open_clip_train.audio_data import get_wds_audio_dataset
         return get_wds_audio_dataset
+    elif dataset_type == "pet":
+        from open_clip_train.pet_data import get_pet_dataset
+        return get_pet_dataset
     elif dataset_type == "csv":
         return get_csv_dataset
     elif dataset_type == "synthetic":

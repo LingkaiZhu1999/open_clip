@@ -40,10 +40,23 @@ class TimmModel(nn.Module):
             pretrained: bool = False,
             model_kwargs: Optional[dict] = None,
             output_tokens: bool = False,
+            num_views: int = 1,
+            view_fusion: str = 'mean',
     ):
         super().__init__()
         if timm is None:
             raise RuntimeError("Please install the latest timm (`pip install timm`) to use timm based models.")
+        if num_views < 1:
+            raise ValueError('num_views must be positive')
+        if num_views > 1 and output_tokens:
+            raise ValueError('Multi-view pooling does not support output_tokens')
+        if view_fusion not in ('mean', 'concat'):
+            raise ValueError("view_fusion must be mean or concat")
+        if view_fusion == 'concat' and (num_views < 2 or proj != 'linear' or pool != 'avg'):
+            raise ValueError("concat fusion requires multiple views, avg pooling, and linear projection")
+        self.view_fusion = view_fusion
+        self.num_views = num_views
+        self.in_chans = (model_kwargs or {}).get("in_chans", 3)
         self.image_size = to_2tuple(image_size)
         # output_tokens: forward returns {'pooled', 'patch_tokens', 'patch_valid'} via the trunk's
         # forward_features/forward_head split -- the token sequence consumed by multimodal
@@ -94,6 +107,9 @@ class TimmModel(nn.Module):
                 reset_kwargs = dict(global_pool=pool) if pool else {}
                 self.trunk.reset_classifier(0, **reset_kwargs)
             prev_chs = self.trunk.num_features
+
+        if view_fusion == 'concat':
+            prev_chs *= num_views
 
         head_layers = OrderedDict()
 
@@ -203,6 +219,8 @@ class TimmModel(nn.Module):
             output_extra_tokens: Return both prefix and spatial intermediate tokens
         Returns:
         """
+        if self.num_views > 1:
+            raise NotImplementedError('Multi-view forward_intermediates is not supported; use forward for pooled embeddings')
         extra_args = {}
         if output_extra_tokens:
             extra_args['return_prefix_tokens'] = True
@@ -250,9 +268,23 @@ class TimmModel(nn.Module):
             _logger.info(f"timm model {self.trunk.__class__.__name__} does not have set_input_size method. Skipping.")
 
     def forward(self, x):
+        if self.num_views > 1:
+            if not isinstance(x, torch.Tensor) or x.ndim != 5 or x.shape[1] != self.num_views:
+                raise ValueError(f'Expected [batch, {self.num_views}, channels, height, width] independent views')
+            batch_size = x.shape[0]
+            # Flatten only the batch/view axes: views never become spatial neighbors.
+            x = x.flatten(0, 1)
         if not self.output_tokens:
             x = self.trunk(x)
+            if self.view_fusion == 'concat':
+                # Fixed view order: concatenate pooled backbone features before projection.
+                x = x.reshape(batch_size, -1)
+                return self.head(x)
             x = self.head(x)
+            if self.num_views > 1:
+                x = nn.functional.normalize(x, dim=-1)
+                x = x.reshape(batch_size, self.num_views, -1).mean(dim=1)
+                # CLIP normalizes this pooled scan embedding before computing logits.
             return x
 
         # Token-output mode: intercept between forward_features and forward_head so the

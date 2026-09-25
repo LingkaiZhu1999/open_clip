@@ -32,7 +32,7 @@ from open_clip.task import (
     unwrap_model,
 )
 from open_clip_train.data import get_data
-from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object
+from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object, all_gather_object
 from open_clip_train.naflex_data import (
     create_naflex_data_config_from_args,
     get_naflex_model_image_seq_len,
@@ -93,15 +93,20 @@ def main(args):
     resume_latest = args.resume == 'latest'
     log_base_path = os.path.join(args.logs, args.name)
     args.log_path = None
+    log_error = None
     if is_master(args, local=args.log_local):
         os.makedirs(log_base_path, exist_ok=True)
         log_filename = f'out-{args.rank}' if args.log_local else 'out.log'
         args.log_path = os.path.join(log_base_path, log_filename)
         if os.path.exists(args.log_path) and not resume_latest:
-            print(
-                "Error. Experiment already exists. Use --name {} to specify a new experiment."
+            log_error = (
+                f"Experiment already exists: {log_base_path}. "
+                "Use a new --name for a new run, or --resume latest to resume an existing checkpoint."
             )
-            return -1
+    # Every rank must make the same startup decision before entering model/DDP setup.
+    log_errors = all_gather_object(args, log_error) if args.distributed else [log_error]
+    if any(log_errors):
+        raise FileExistsError(next(error for error in log_errors if error))
 
     # Setup text logger
     args.log_level = logging.DEBUG if args.debug else logging.INFO
@@ -749,4 +754,8 @@ def main(args):
     
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

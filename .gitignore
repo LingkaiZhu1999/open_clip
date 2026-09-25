@@ -151,3 +151,6 @@ core.*
 
 # Allow
 !src/evaluation/misc/results_dbs/*
+
+# Local PET data, reports, checkpoints, and experiment outputs
+.local/

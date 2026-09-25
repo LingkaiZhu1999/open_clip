@@ -53,7 +53,11 @@ class ImageTextTask(TrainingTask):
                 image_size = model.visual.image_size
             if not isinstance(image_size, tuple):
                 image_size = (image_size, image_size)
-            image = torch.zeros(batch_size, 3, *image_size, device=device, dtype=dtype)
+            num_views = getattr(model.visual, "num_views", 1)
+            image_shape = (batch_size, getattr(model.visual, "in_chans", 3), *image_size)
+            if num_views > 1:
+                image_shape = (batch_size, num_views, *image_shape[1:])
+            image = torch.zeros(image_shape, device=device, dtype=dtype)
 
         return {
             "image": image,

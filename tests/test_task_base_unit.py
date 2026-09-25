@@ -125,6 +125,23 @@ def test_create_dummy_batch_tuple_image_size():
     assert batch["text"].shape == (1, 7)
 
 
+def test_create_dummy_batch_respects_single_channel_montage():
+    model = TinyModel()
+    model.visual.in_chans = 1
+    model.visual.image_size = (310, 620)
+    task = CLIPTask(model, loss=DummyLoss())
+    assert task.create_dummy_batch(batch_size=2)['image'].shape == (2, 1, 310, 620)
+
+
+def test_create_dummy_batch_respects_independent_views():
+    model = TinyModel()
+    model.visual.in_chans = 1
+    model.visual.num_views = 2
+    model.visual.image_size = (310, 310)
+    task = CLIPTask(model, loss=DummyLoss())
+    assert task.create_dummy_batch(batch_size=2)['image'].shape == (2, 2, 1, 310, 310)
+
+
 def test_create_dummy_batch_respects_dtype():
     task = CLIPTask(TinyModel(), loss=DummyLoss())
     batch = task.create_dummy_batch(image_size=8, context_length=5, dtype=torch.float16)

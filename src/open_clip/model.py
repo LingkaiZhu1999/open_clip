@@ -68,6 +68,8 @@ class CLIPVisionCfg:
     scale_attn: bool = False  # apply layer norm after full attention block
     scale_fc: bool = False  # apply layer norm in MLP block
 
+    timm_num_views: int = 1  # independently encode views with a shared backbone
+    timm_view_fusion: str = 'mean'  # mean normalized embeddings or concatenate before projection
     timm_model_name: Optional[str] = None  # a valid model name overrides layers, width, patch_size
     timm_model_pretrained: bool = False  # use (imagenet) pretrained weights for named model
     timm_pool: str = 'avg'  # feature pooling for timm model ('abs_attn', 'rot_attn', 'avg', '')
@@ -204,6 +206,9 @@ def _build_vision_tower(
     # NOTE: timm models always use native GELU regardless of quick_gelu flag.
     act_layer = QuickGELU if quick_gelu else nn.GELU
 
+    if vision_cfg.timm_num_views != 1 and not vision_cfg.timm_model_name:
+        raise ValueError('timm_num_views requires a timm vision tower')
+
     if vision_cfg.timm_model_name:
         timm_model_kwargs = dict(vision_cfg.timm_model_kwargs or {})
         if vision_cfg.naflex_patch_interp:
@@ -229,6 +234,8 @@ def _build_vision_tower(
             image_size=vision_cfg.image_size,
             model_kwargs=timm_model_kwargs or None,
             output_tokens=vision_cfg.output_tokens,
+            num_views=vision_cfg.timm_num_views,
+            view_fusion=vision_cfg.timm_view_fusion,
         )
     elif vision_cfg.naflex_patch_interp:
         raise ValueError(
