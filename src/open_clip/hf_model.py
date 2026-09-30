@@ -116,6 +116,7 @@ class HFTextEncoder(nn.Module):
             pretrained: bool = True,
             output_tokens: bool = False,
             model_config: Optional[dict] = None,
+            windowed_context_length: Optional[int] = None,
     ):
         super().__init__()
         self.output_tokens = output_tokens
@@ -187,6 +188,14 @@ class HFTextEncoder(nn.Module):
         self.context_length = getattr(self.config, 'max_position_embeddings', 0)
 
         self.pooler = _POOLERS[pooler_type]()
+        self.windowed_context_length = windowed_context_length
+        if windowed_context_length is not None:
+            if (self.config.model_type != 'bert' or pooler_type != 'mean_pooler'
+                    or any(x is None for x in (self.pad_id, self.bos_id, self.eos_id))):
+                raise ValueError('Windowed reports require BERT mean pooling with explicit pad/CLS/SEP ids')
+            if windowed_context_length < 3:
+                raise ValueError('Windowed context must include at least one content token and CLS/SEP')
+            self.context_length = windowed_context_length
 
         d_model = getattr(self.config, arch_dict[self.config.model_type]["config_names"]["width"])
         if (d_model == output_dim) and (proj_type is None):  # do we always need a proj?
@@ -208,7 +217,7 @@ class HFTextEncoder(nn.Module):
                 nn.Linear(output_dim, output_dim, bias=True),
             )
 
-    def forward(self, x: TensorType, attention_mask: Optional[TensorType] = None):
+    def forward(self, x: TensorType, attention_mask: Optional[TensorType] = None, return_tokens: bool = False):
         if attention_mask is not None:
             # data-layer provided validity ([B, L], True/1 = real token)
             attn_mask = attention_mask.long()
@@ -217,6 +226,8 @@ class HFTextEncoder(nn.Module):
         else:
             # pad-value fallback: the id this tower's HF config reserves for padding
             attn_mask = (x != self.config.pad_token_id).long()
+        if self.windowed_context_length is not None:
+            return self._forward_windows(x, attn_mask, return_tokens)
         out = self.transformer(input_ids=x, attention_mask=attn_mask)
         pooled_out = self.pooler(out, attn_mask)
         projected = self.proj(pooled_out)
@@ -228,9 +239,42 @@ class HFTextEncoder(nn.Module):
             else out.last_hidden_state
         )
         
-        if self.output_tokens:
+        if self.output_tokens or return_tokens:
             return projected, tokens
         return projected
+
+    def _forward_windows(self, x, attention_mask, return_tokens):
+        """Encode content in native-position BERT windows, preserving input token axes.
+
+        Every window gets its own CLS/SEP. Global pooling is a content-token-weighted
+        mean across windows, excluding padding/special tokens; local hidden states
+        map back to original token positions. There is no cross-window attention.
+        """
+        if x.shape[1] > self.context_length:
+            raise ValueError(f'Report exceeds configured context {self.context_length}')
+        valid = attention_mask.bool() & (x != self.pad_id) & (x != self.bos_id) & (x != self.eos_id)
+        width = self.config.max_position_embeddings - 2
+        empty = self.transformer.get_input_embeddings().weight.new_zeros(x.shape[0], 1, self.config.hidden_size)
+        parts = [empty]
+        for start in range(1, x.shape[1] - 1, width):
+            end = min(start + width, x.shape[1] - 1)
+            ids = x[:, start:end]
+            mask = valid[:, start:end]
+            if not mask.any():
+                parts.append(self.transformer.get_input_embeddings().weight.new_zeros(
+                    x.shape[0], ids.shape[1], self.config.hidden_size))
+                continue
+            cls = x.new_full((len(x), 1), self.bos_id)
+            sep = x.new_full((len(x), 1), self.eos_id)
+            window_ids = torch.cat((cls, ids.masked_fill(~mask, self.pad_id), sep), dim=1)
+            special_valid = torch.ones_like(cls)
+            window_mask = torch.cat((special_valid, mask.long(), special_valid), dim=1)
+            out = self.transformer(input_ids=window_ids, attention_mask=window_mask)
+            parts.append(out.last_hidden_state[:, 1:-1].masked_fill(~mask[..., None], 0))
+        tokens = torch.cat([*parts, empty], dim=1)
+        pooled = tokens.sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1)
+        projected = self.proj(pooled)
+        return (projected, tokens) if self.output_tokens or return_tokens else projected
 
     def layer_groups(self, pooler_in_head: bool = True):
         """Ordered, complete partition of this text tower into named ``(name, [members])`` groups, input -> output.

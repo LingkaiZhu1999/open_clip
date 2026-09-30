@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from .image_text_task import ImageTextTask
+from .base_task import unwrap_model
 
 
 class CLIPTask(ImageTextTask):
@@ -29,7 +30,13 @@ class CLIPTask(ImageTextTask):
             self.loss = loss
         elif default_loss:
             from open_clip.loss import ClipLoss
-            self.loss = ClipLoss(
+            region_cfg = getattr(unwrap_model(model), 'region_cfg', None)
+            if region_cfg is not None:
+                from open_clip.local_region import RegionClipLoss
+                loss_class = lambda **options: RegionClipLoss(region_cfg, **options)
+            else:
+                loss_class = ClipLoss
+            self.loss = loss_class(
                 local_loss=local_loss,
                 gather_with_grad=gather_with_grad,
                 cache_labels=cache_labels,
@@ -47,4 +54,7 @@ class CLIPTask(ImageTextTask):
 
     def eval_forward(self, batch: Dict[str, torch.Tensor]):
         inputs = {key: batch[key] for key in self.data_keys if key in batch}
-        return self.get_trainable_module(use_ema=True)(**inputs)
+        model = self.get_trainable_module(use_ema=True)
+        if getattr(unwrap_model(model), 'region_cfg', None) is not None and all(k in inputs for k in ('image', 'text')):
+            inputs['return_local'] = True
+        return model(**inputs)

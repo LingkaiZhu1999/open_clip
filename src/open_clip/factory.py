@@ -1191,6 +1191,13 @@ def create_task(args, model, dist_model=None, naflex_data_config=None):
         )
     elif task_cls is SigLIPTask:
         options.update(dist_impl=args.loss_dist_impl, chunk_size=getattr(args, 'siglip_chunk_size', 0))
+    region_cfg = getattr(model_unwrapped, 'region_cfg', None)
+    if region_cfg is not None:
+        if task_cls is not CLIPTask:
+            raise ValueError('Region alignment currently supports CLIPTask only')
+        if (getattr(args, 'accum_freq', 1) != 1 or getattr(args, 'fsdp', False)
+                or getattr(args, 'torchcompile', False)):
+            raise ValueError('Region alignment requires accum_freq=1, eager execution, and DDP (not FSDP)')
     task = (task_cls(model, dist_model, **options) if task_cls is DistillCLIPTask
             else task_cls(model, **options))
     if naflex_data_config is not None:

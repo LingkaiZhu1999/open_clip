@@ -74,6 +74,9 @@ def parse_args(args):
     parser.add_argument('--pet-image-size', type=int, default=310, help='Per-view PET output size for training (and validation unless overridden)')
     parser.add_argument('--pet-canvas-size', type=int, default=310, help='PET crop/padding canvas before output resizing')
     parser.add_argument('--pet-val-image-size', type=int, default=None, help='PET validation output size; defaults to --pet-image-size')
+    parser.add_argument('--pet-region-loss-weight', type=float, default=None, help='Override PET local-alignment model region loss weight (positive)')
+    parser.add_argument('--pet-region-max-tokens', type=int, default=None, help='Maximum uniformly sampled content tokens for local alignment')
+    parser.add_argument('--pet-region-chunk-size', type=int, default=None, help='Image/report chunk size for checkpointed region matching')
     parser.add_argument('--pet-intensity-max', type=float, default=30., help='PET display window upper limit')
     parser.add_argument('--pet-limit-per-split', type=int, default=0, help='In-memory smoke subset; 0 uses all pairs')
     parser.add_argument(

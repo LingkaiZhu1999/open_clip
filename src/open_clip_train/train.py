@@ -534,6 +534,14 @@ def evaluate(task, data, epoch, args, tb_writer=None, tokenizer=None):
         # accumulation and exact pair scoring remain O(N * D) memory and O(N^2)
         # compute respectively.
         cumulative_loss = 0.0
+        cumulative_local_loss = 0.0
+        local_num_samples = 0
+        region_cfg = getattr(get_model_from_task(task), 'region_cfg', None)
+        region_eval_loss = None
+        if is_rank0 and region_cfg is not None:
+            from open_clip.local_region import RegionClipLoss
+            # Deliberately world_size=1: other DDP ranks do not enter evaluation.
+            region_eval_loss = RegionClipLoss(region_cfg)
         cumulative_gen_loss = 0.0
         gen_loss_pad_id = getattr(get_model_from_task(task), 'pad_id', 0)
         all_primary_features, all_text_features = [], []
@@ -566,6 +574,12 @@ def evaluate(task, data, epoch, args, tb_writer=None, tokenizer=None):
                             F.cross_entropy(logits_per_text, labels)
                         ) / 2
                         cumulative_loss += total_loss * batch_size
+                        if region_eval_loss is not None:
+                            local_loss = region_eval_loss.validation_loss(
+                                model_out['region_features'], model_out['local_text_features'],
+                                model_out['local_text_valid'])
+                            cumulative_local_loss += local_loss * batch_size
+                            local_num_samples += batch_size
                         gen_loss = maybe_compute_generative_loss(
                             model_out,
                             texts=batch.get("text"),
@@ -587,6 +601,9 @@ def evaluate(task, data, epoch, args, tb_writer=None, tokenizer=None):
                             _logger.info(
                                 f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
                                 f"Clip Loss: {cumulative_loss / num_samples:.6f}\t")
+                        if local_num_samples:
+                            _logger.info(
+                                f"Local Alignment Loss: {cumulative_local_loss / local_num_samples:.6f}\t")
                         if gen_loss is not None:
                             _logger.info(
                                 f"Generative Loss: {cumulative_gen_loss / num_samples:.6f}\t")
@@ -619,6 +636,14 @@ def evaluate(task, data, epoch, args, tb_writer=None, tokenizer=None):
                 else:
                     # Generative-only task (e.g. GenLIP): no retrieval metrics, just the LM/caption loss.
                     metrics.update({"epoch": epoch, "num_samples": num_samples})
+                if local_num_samples:
+                    local_loss = (cumulative_local_loss / local_num_samples).item()
+                    global_loss = (cumulative_loss / num_samples).item()
+                    weighted_local = region_cfg['weight'] * local_loss
+                    metrics.update(global_val_loss=global_loss, local_val_loss=local_loss,
+                                   weighted_local_val_loss=weighted_local,
+                                   total_val_loss=global_loss + weighted_local,
+                                   local_val_num_samples=local_num_samples)
                 if isinstance(cumulative_gen_loss, torch.Tensor):
                     metrics.update({"val_generative_loss": (cumulative_gen_loss / num_samples).item()})
 

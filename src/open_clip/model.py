@@ -169,6 +169,7 @@ class CLIPTextCfg:
     # HuggingFace specific text tower config
     hf_model_name: Optional[str] = None
     hf_model_pretrained: bool = True
+    hf_windowed: bool = False  # encode long reports with native-position windows
     hf_proj_type: str = 'mlp'
     hf_pooler_type: str = 'mean_pooler'  # attentional pooling for HF models
     hf_model_config: Optional[dict] = None  # HF config overrides, e.g. {"hidden_dropout_prob": 0.0}
@@ -335,6 +336,7 @@ def _build_text_tower(
             pretrained=text_cfg.hf_model_pretrained,
             output_tokens=text_cfg.output_tokens,
             model_config=text_cfg.hf_model_config,
+            windowed_context_length=text_cfg.context_length if text_cfg.hf_windowed else None,
         )
     else:
         act_layer = QuickGELU if quick_gelu else nn.GELU
@@ -430,6 +432,7 @@ class CLIP(nn.Module):
             nonscalar_logit_scale: bool = False,
             cast_dtype: Optional[torch.dtype] = None,
             output_dict: bool = False,
+            region_cfg: Optional[dict] = None,
     ):
         super().__init__()
         text_arch = (
@@ -468,6 +471,11 @@ class CLIP(nn.Module):
         else:
             self.logit_bias = None
 
+        self.region_cfg = None
+        if region_cfg is not None:
+            from .local_region import configure_region_branch
+            configure_region_branch(self, region_cfg)
+
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
         self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
@@ -495,7 +503,7 @@ class CLIP(nn.Module):
     def encode_image(self, image, normalize: bool = False):
         return self._encode_image(image, normalize=normalize)
 
-    def _encode_text(self, text, normalize: bool = False):
+    def _encode_text(self, text, normalize: bool = False, return_local: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
 
         x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
@@ -503,6 +511,9 @@ class CLIP(nn.Module):
         x = x + self.positional_embedding.to(cast_dtype)
         x = self.transformer(x, attn_mask=self.attn_mask)
         x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+        if return_local:
+            from .local_region import select_local_tokens
+            local_features, local_valid = select_local_tokens(self, x, text)
         x = text_global_pool(x, text, self.text_pool_type, eos_token_id=getattr(self, "text_eos_id", None))
         if self.text_projection is not None:
             if isinstance(self.text_projection, nn.Linear):
@@ -510,7 +521,22 @@ class CLIP(nn.Module):
             else:
                 x = x @ self.text_projection
 
-        return F.normalize(x, dim=-1) if normalize else x
+        x = F.normalize(x, dim=-1) if normalize else x
+        return (x, local_features, local_valid) if return_local else x
+
+    def encode_regions(self, image):
+        """Normalized [B, view, H, W, D] features for local PET alignment."""
+        if self.region_cfg is None:
+            raise ValueError('Model has no region branch; use PET-ResNet34-Local')
+        from .local_region import encode_image_regions
+        return encode_image_regions(self, image)[1]
+
+    def encode_local_text(self, text):
+        """Return sampled contextual subword features and their valid mask."""
+        if self.region_cfg is None:
+            raise ValueError('Model has no region branch; use PET-ResNet34-Local')
+        _, features, valid = self._encode_text(text, return_local=True)
+        return features, valid
 
     def encode_text(self, text, normalize: bool = False):
         return self._encode_text(text, normalize=normalize)
@@ -610,7 +636,16 @@ class CLIP(nn.Module):
             self,
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
+            return_local: bool = False,
     ):
+        if self.region_cfg is not None and (self.training or return_local) and image is not None and text is not None:
+            from .local_region import encode_image_regions
+            image_features, regions = encode_image_regions(self, image)
+            text_features, tokens, valid = self._encode_text(text, normalize=True, return_local=True)
+            return dict(image_features=image_features, text_features=text_features,
+                        logit_scale=self.logit_scale.exp(), logit_bias=self.logit_bias,
+                        region_features=regions.flatten(1, 3),
+                        local_text_features=tokens, local_text_valid=valid)
         image_features = self._encode_image(image, normalize=True) if image is not None else None
         text_features = self._encode_text(text, normalize=True) if text is not None else None
         return _pack_clip_output(
@@ -631,6 +666,7 @@ class CustomTextCLIP(nn.Module):
             nonscalar_logit_scale: bool = False,
             cast_dtype: Optional[torch.dtype] = None,
             output_dict: bool = False,
+            region_cfg: Optional[dict] = None,
     ):
         super().__init__()
         self.output_dict = output_dict
@@ -646,6 +682,11 @@ class CustomTextCLIP(nn.Module):
             self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
         else:
             self.logit_bias = None
+
+        self.region_cfg = None
+        if region_cfg is not None:
+            from .local_region import configure_region_branch
+            configure_region_branch(self, region_cfg)
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
@@ -676,9 +717,21 @@ class CustomTextCLIP(nn.Module):
     def encode_image(self, image, normalize: bool = False):
         return self._encode_image(image, normalize=normalize)
 
-    def _encode_text(self, text, normalize: bool = False):
+    def _encode_text(self, text, normalize: bool = False, return_local: bool = False):
+        if return_local:
+            from .local_region import select_local_tokens
+            features, hidden = self.text(text, return_tokens=True)
+            content_mask = torch.ones_like(text, dtype=torch.bool)
+            for token_id in (self.text.pad_id, self.text.bos_id, self.text.eos_id):
+                content_mask &= text != token_id
+            tokens, valid = select_local_tokens(self, hidden, text, content_mask)
+            features = F.normalize(features, dim=-1) if normalize else features
+            return features, tokens, valid
         features = self.text(text)
         return F.normalize(features, dim=-1) if normalize else features
+
+    encode_regions = CLIP.encode_regions
+    encode_local_text = CLIP.encode_local_text
 
     def encode_text(self, text, normalize: bool = False):
         return self._encode_text(text, normalize=normalize)
@@ -762,7 +815,16 @@ class CustomTextCLIP(nn.Module):
             self,
             image: Optional[torch.Tensor] = None,
             text: Optional[torch.Tensor] = None,
+            return_local: bool = False,
     ):
+        if self.region_cfg is not None and (self.training or return_local) and image is not None and text is not None:
+            from .local_region import encode_image_regions
+            image_features, regions = encode_image_regions(self, image)
+            text_features, tokens, valid = self._encode_text(text, normalize=True, return_local=True)
+            return dict(image_features=image_features, text_features=text_features,
+                        logit_scale=self.logit_scale.exp(), logit_bias=self.logit_bias,
+                        region_features=regions.flatten(1, 3),
+                        local_text_features=tokens, local_text_valid=valid)
         image_features = self._encode_image(image, normalize=True) if image is not None else None
         text_features = self._encode_text(text, normalize=True) if text is not None else None
         return _pack_clip_output(

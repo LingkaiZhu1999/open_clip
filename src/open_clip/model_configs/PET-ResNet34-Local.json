@@ -1,0 +1,31 @@
+{
+    "embed_dim": 512,
+    "vision_cfg": {
+        "image_size": 310,
+        "timm_model_name": "resnet34",
+        "timm_model_pretrained": false,
+        "timm_pool": "avg",
+        "timm_proj": "linear",
+        "timm_model_kwargs": {
+            "in_chans": 1
+        },
+        "timm_num_views": 2,
+        "timm_view_fusion": "concat"
+    },
+    "text_cfg": {
+        "context_length": 2560,
+        "vocab_size": 49408,
+        "width": 512,
+        "heads": 8,
+        "layers": 12
+    },
+    "region_cfg": {
+        "dim": 128,
+        "max_tokens": 128,
+        "chunk_size": 4,
+        "weight": 1.0,
+        "attention_temperature": 0.1,
+        "word_temperature": 0.1,
+        "contrastive_temperature": 0.07
+    }
+}

@@ -41,4 +41,9 @@ def create_loss_from_args(args, model):
     elif loss_type == "siglip":
         kwargs.update(dist_impl=args.loss_dist_impl, chunk_size=getattr(args, 'siglip_chunk_size', 0))
 
+    if getattr(model, 'region_cfg', None) is not None:
+        if loss_type != 'clip':
+            raise ValueError('Region alignment requires the CLIP loss')
+        from open_clip.local_region import RegionClipLoss
+        return RegionClipLoss(model.region_cfg, **kwargs)
     return create_loss(loss_type, **kwargs)

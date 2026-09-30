@@ -35,16 +35,16 @@ PYCHECK
   distributed_args=(--device cuda --dist-backend nccl --local-loss --gather-with-grad)
 fi
 # Both towers initialize randomly: no --pretrained or --pretrained-image.
-# Compilation is opt-in: compiled text backward OOMs at batch 256 with 2560 tokens.
+# Compilation is opt-in: compiled text backward OOMs at batch 256 with 1024 tokens.
 training_args=(
   --model PET-ResNet34
   --dataset-type pet --pet-split-column split0 --pet-cache ram --pet-report-sections findings_impression
   --train-data "$DATA_DIR" --val-data "$DATA_DIR"
-  --force-context-length 2560 --force-image-size 224
-  --pet-canvas-size 310 --pet-image-size 224 --pet-val-image-size 310 --pet-intensity-max 30
-  --batch-size 256 --workers 16 --epochs 50 --warmup 200
+  --force-context-length 1024 --force-image-size 224
+  --pet-canvas-size 310 --pet-image-size 224 --pet-val-image-size 224 --pet-intensity-max 30
+  --batch-size 256 --workers 16 --epochs 10 --warmup 20
   --lr 5e-4 --wd 0.1 --precision amp_bf16 --grad-checkpointing --report-to wandb --wandb-project-name pet-resnet34-concat-scratch
-  --seed 0 --val-frequency 1 --zeroshot-frequency 0 --save-frequency 1 --delete-previous-checkpoint
+  --seed 0 --val-frequency 1 --zeroshot-frequency 0 --save-frequency 1 
   --logs "$REPO_DIR/.local/pet/logs" --name pet-resnet34-concat-scratch
 )
 exec "${launch[@]}" "${training_args[@]}" "${distributed_args[@]}" "$@"

@@ -225,6 +225,18 @@ def main(args):
         args.force_image_size = args.force_image_size[0]
     random_seed(args.seed, 0)
     model_kwargs = {}
+    region_overrides = {
+        key: value for key, value in dict(
+            weight=args.pet_region_loss_weight, max_tokens=args.pet_region_max_tokens,
+            chunk_size=args.pet_region_chunk_size).items() if value is not None
+    }
+    if region_overrides:
+        if args.model not in ('PET-ResNet34-Local', 'PET-ResNet34-BioClinicalBERT-Local'):
+            raise ValueError('PET region overrides require a PET local-alignment model')
+        from open_clip import get_model_config
+        region_config = get_model_config(args.model)['region_cfg']
+        region_config.update(region_overrides)
+        model_kwargs['region_cfg'] = region_config
     if args.siglip:
         model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
         model_kwargs['init_logit_bias'] = -10
