@@ -191,6 +191,12 @@ def _train_step_eager(task, batch, accum_state, optimizer, scaler, autocast, arg
         _finish_eager_train_step(task, optimizer, scaler, args)
         return losses, report, task.batch_size(batch), accum_state
 
+    if (getattr(args, 'dataset_type', None) == 'pet' and getattr(args, 'world_size', 1) == 1
+            and not getattr(args, 'fsdp', False) and not getattr(args, 'distill', False)):
+        from open_clip_train.pet_accum import pet_cached_accum_step
+        return pet_cached_accum_step(task, batch, accum_state, optimizer, scaler, autocast, args,
+                                     _finish_eager_train_step)
+
     accum_batches, accum_features = accum_state
 
     # First, cache the features without any gradient tracking.

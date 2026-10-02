@@ -42,6 +42,7 @@ class TimmModel(nn.Module):
             output_tokens: bool = False,
             num_views: int = 1,
             view_fusion: str = 'mean',
+            view_fusion_cfg: Optional[dict] = None,
     ):
         super().__init__()
         if timm is None:
@@ -50,10 +51,12 @@ class TimmModel(nn.Module):
             raise ValueError('num_views must be positive')
         if num_views > 1 and output_tokens:
             raise ValueError('Multi-view pooling does not support output_tokens')
-        if view_fusion not in ('mean', 'concat'):
-            raise ValueError("view_fusion must be mean or concat")
-        if view_fusion == 'concat' and (num_views < 2 or proj != 'linear' or pool != 'avg'):
-            raise ValueError("concat fusion requires multiple views, avg pooling, and linear projection")
+        if view_fusion not in ('mean', 'concat', 'attention'):
+            raise ValueError("view_fusion must be mean, concat, or attention")
+        if view_fusion in ('concat', 'attention') and (num_views < 2 or proj != 'linear' or pool != 'avg'):
+            raise ValueError(f"{view_fusion} fusion requires multiple views, avg pooling, and linear projection")
+        if view_fusion_cfg is not None and view_fusion != 'attention':
+            raise ValueError('view_fusion_cfg requires attention fusion')
         self.view_fusion = view_fusion
         self.num_views = num_views
         self.in_chans = (model_kwargs or {}).get("in_chans", 3)
@@ -112,6 +115,11 @@ class TimmModel(nn.Module):
             prev_chs *= num_views
 
         head_layers = OrderedDict()
+        if view_fusion == 'attention':
+            from .multiview_attention import SpatialViewAttention
+            head_layers['fusion'] = SpatialViewAttention(
+                self.trunk.num_features, num_views, **(view_fusion_cfg or {}))
+            prev_chs = head_layers['fusion'].width
 
         # Add custom pooling to head
         if pool == 'abs_attn':
@@ -182,11 +190,15 @@ class TimmModel(nn.Module):
         # Surface the timm trunk's own no-weight-decay params (e.g. a ViT's pos_embed/cls_token, which are not
         # 1-D and so would otherwise be decayed), prefixed under ``trunk.`` to match this module's param names.
         # Not every timm model defines it (e.g. resnets do not), hence the guard.
-        if not hasattr(self.trunk, 'no_weight_decay'):
-            return set()
-        return {f'trunk.{n}' for n in self.trunk.no_weight_decay()}
+        names = ({f'trunk.{n}' for n in self.trunk.no_weight_decay()}
+                 if hasattr(self.trunk, 'no_weight_decay') else set())
+        if self.view_fusion == 'attention':
+            names.update({'head.fusion.view_embed', 'head.fusion.queries'})
+        return names
 
     def set_grad_checkpointing(self, enable: bool = True, impl: str = 'inline'):
+        if self.view_fusion == 'attention':
+            self.head.fusion.grad_checkpointing = enable
         if impl == 'composable':
             _logger.warning(
                 'Composable activation checkpointing is not supported for timm models, '
@@ -267,6 +279,21 @@ class TimmModel(nn.Module):
         else:
             _logger.info(f"timm model {self.trunk.__class__.__name__} does not have set_input_size method. Skipping.")
 
+    def fuse_spatial_features(self, spatial, return_tokens=False):
+        """Fuse flattened [B*V,C,H,W] backbone maps; optionally expose [B,V,H,W,D]."""
+        if self.view_fusion != 'attention':
+            raise ValueError('fuse_spatial_features requires attention fusion')
+        if spatial.ndim != 4 or spatial.shape[0] % self.num_views:
+            raise ValueError('Attention fusion requires [B*V,C,H,W] backbone features')
+        spatial = spatial.reshape(-1, self.num_views, *spatial.shape[1:])
+        tokens = self.head.fusion.encode_tokens(spatial)
+        pooled = self.head.fusion.pool_tokens(tokens)
+        embedding = self.head.proj(self.head.drop(pooled))
+        if return_tokens:
+            batch, views, _, height, width = spatial.shape
+            return embedding, tokens.reshape(batch, views, height, width, -1)
+        return embedding
+
     def forward(self, x):
         if self.num_views > 1:
             if not isinstance(x, torch.Tensor) or x.ndim != 5 or x.shape[1] != self.num_views:
@@ -275,6 +302,8 @@ class TimmModel(nn.Module):
             # Flatten only the batch/view axes: views never become spatial neighbors.
             x = x.flatten(0, 1)
         if not self.output_tokens:
+            if self.view_fusion == 'attention':
+                return self.fuse_spatial_features(self.trunk.forward_features(x))
             x = self.trunk(x)
             if self.view_fusion == 'concat':
                 # Fixed view order: concatenate pooled backbone features before projection.

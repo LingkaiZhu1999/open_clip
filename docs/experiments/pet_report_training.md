@@ -1,15 +1,398 @@
 # PET–report OpenCLIP: consolidated experiment report
 
-Updated 2026-09-25. The new Bio_ClinicalBERT experiment fine-tunes a **pretrained
+Updated 2026-10-02. The Bio_ClinicalBERT experiments fine-tune a **pretrained
 text encoder** with a randomly initialized PET image encoder. Earlier experiments
 trained both encoders from scratch. This report replaces
 the separate training, local-learning, performance, and dated run-analysis reports.
 
-**Current findings:** global-only training substantially overfits. GLoRIA-style
-local alignment is implemented and tested, but improved generalization or grounding
-is not yet established. At 128 pairs/GPU, increasing local chunk size from 4 to 32
-reduced measured full training time from **22.364 to 5.439 s/step**. Use chunk 32
-for the next local experiment; the launcher still defaults to 4.
+**Current findings:** all 12 A/B/C HPO trials completed. ImageNet initialization
+(C) with LR **5e-5**, warmup **60 updates** gives the lowest global validation loss
+and **12.37% text→image R@5** at its retained checkpoint. Scratch A/B reach
+3.81%/3.61%; adding local alignment has no consistent retrieval benefit in this
+grid. Higher-LR runs show modest late overfitting, handled by early stopping.
+The new ResNet50 attention architecture remains untrained. Experiment D now tests
+ImageNet ResNet34 with global + 0.1 local alignment, matching C's selected settings.
+
+## D: ImageNet initialization with global + local alignment — 2026-10-02
+
+**Status: running on GPU 0; first 512-pair optimizer update completed successfully.**
+D is the matched extension of C requested after
+the completed A/B/C search. It initializes from the same ImageNet ResNet34 and
+pretrained Bio_ClinicalBERT weights used at the start of C. Global concatenation/
+projection weights use the same seed; the two local projection matrices initialize
+randomly. This is a fresh ablation, with no resume from C's trained checkpoint.
+Offline CPU verification found **exact equality of all 416 shared parameter/buffer
+tensors** between C and D at initialization; the only additional tensors are
+`region_image_projection.weight` and `region_text_projection.weight`.
+
+| Setting | D |
+| --- | --- |
+| Model | `PET-ResNet34-BioClinicalBERT-Local`, `--pretrained-image` |
+| Loss | Global + 0.1 × local; region dimension 128, up to 128 text tokens, chunk 32 |
+| Learning rate / warmup | 5e-5 / 60 optimizer updates |
+| Batch / GPU / precision | 256 × accumulation 2 = 512 candidates; GPU 0; BF16 |
+| Data / image / text | split0; RAM cache; 224×224 inputs, canvas 310, SUV clip 30; Findings/Impression, context 1024 |
+| Optimizer / schedule | AdamW, weight decay 0.1, cosine, seed 0, gradient checkpointing, workers 4 |
+| Duration / selection | Maximum 20 epochs; patience 3; minimum global validation loss |
+| Checkpoints | One `D/best.pt`; fresh selection threshold infinity |
+
+`scripts/run_pet_d.py` derives its command directly from the completed C winner,
+preserving all training settings except the added local branch and its options.
+Its initial selection threshold is reset to infinity so D saves its own best
+regardless of C's validation score. The existing training launcher was verified
+identical to the C campaign's saved source snapshot. Logs and source snapshots:
+`.local/pet/logs/d-20261002-imagenet-local/`; command/process state in `status.json`,
+terminal stderr/stdout in `terminal.log`, epoch metrics under `trials/`.
+W&B project remains `pet-bioclinicalbert-hpo`; run name
+`d-20261002-imagenet-local-D`. GPU 1 remains available to other users.
+Actual saved `params.txt` values were compared with C: only the model/local
+options, output paths and fresh checkpoint-selection threshold differ. The first
+update had finite global/local losses (6.2660 and 0.62786 weighted local), total
+6.8938, with about 23.6 GiB GPU memory in use. These are startup measurements,
+not validation results. Live [W&B run](https://wandb.ai/lingkai1999-chalmers-university-of-technology/pet-bioclinicalbert-hpo/runs/d-20261002-imagenet-local-D).
+
+At launch, GPU 0 was idle and about 4.5 GiB was free on the original checkpoint
+disk, enough for a retained ~1.56 GB checkpoint and its atomic replacement.
+Compare D against C's retained global loss **3.7766**, text→image R@5 **12.37%**,
+and image→text R@5 **12.45%**. Global/local validation losses and retrieval are
+logged; improved visual grounding requires a separate evaluation. The test split
+remains unused. Results are pending.
+
+## Completed A/B/C comparison — 2026-10-02
+
+**C is the strongest observed baseline; LR 5e-5 and warmup 60 minimize validation
+loss in all three conditions.** This is a completed, single-seed, four-setting
+search per condition, not an exhaustive optimum. A = scratch ResNet34/global loss;
+B = scratch ResNet34/global + 0.1 local; C = ImageNet ResNet34/global loss.
+All use two independent PET views, shared backbone weights, pooled concatenation
+and linear projection, with pretrained, fine-tuned Bio_ClinicalBERT. Neither the
+new attention fusion nor DINO was used in these experiments.
+
+**Comparison basis:** train 10,785 pairs; validation 2,466 pairs; patient-separated
+split0; test split unused. One A6000, physical batch 256, accumulation 2, effective
+contrastive batch 512; BF16; images 224×224, canvas 310, SUV clip 30; Findings/
+Impression text, context 1024; AdamW, weight decay 0.1, cosine schedule, seed 0.
+Warmup 20/60 means optimizer updates (about 0.95/2.86 epochs), not batches or
+epochs. There are 21 updates/epoch and a scheduled maximum of 20 epochs.
+
+Selection minimizes `clip_val_loss`: sample-weighted global contrastive loss over
+the entire validation split, computed within batches of up to 256 candidates.
+Retrieval instead ranks the full **2,466-item gallery**. R@5 is the percentage of
+queries whose designated paired scan/report is among the first five; random
+ranking averages 0.203%. Every retrieval value below is from that trial's
+**minimum-global-loss epoch**, not necessarily its peak-retrieval or final epoch.
+
+### Full search: larger learning rate improved all conditions
+
+| Run | LR | Warmup updates | Best/end epoch | Global val loss ↓ | Text→image R@5 ↑ | Image→text R@5 ↑ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 1e-5 | 20 | 19/20 | 5.1172 | 1.34% | 1.30% |
+| A | 1e-5 | 60 | 19/20 | 5.0953 | 1.42% | 1.22% |
+| A | 5e-5 | 20 | 13/16 | 4.7599 | 3.33% | 3.37% |
+| A | 5e-5 | 60 | 12/15 | 4.6681 | 3.81% | 4.26% |
+| B | 1e-5 | 20 | 19/20 | 5.1241 | 1.09% | 1.22% |
+| B | 1e-5 | 60 | 19/20 | 5.1104 | 1.14% | 1.14% |
+| B | 5e-5 | 20 | 14/17 | 4.7556 | 3.85% | 3.20% |
+| B | 5e-5 | 60 | 14/17 | 4.7442 | 3.61% | 3.81% |
+| C | 1e-5 | 20 | 19/20 | 4.6859 | 1.78% | 3.00% |
+| C | 1e-5 | 60 | 20/20 | 4.6360 | 2.43% | 3.00% |
+| C | 5e-5 | 20 | 14/17 | 3.8081 | 12.41% | 11.92% |
+| C | 5e-5 | 60 | 15/18 | 3.7766 | 12.37% | 12.45% |
+
+At matched warmup 60, increasing LR raises text→image R@5 from 1.42% to 3.81%
+(A), 1.14% to 3.61% (B), and 2.43% to 12.37% (C). Within this training budget,
+the lower LR is less effective. Warmup 60 lowers minimum global validation loss
+for all six matched condition/LR comparisons, but does **not** uniformly improve
+retrieval. For C at LR 5e-5, warmup 20 retrieves 306/2,466 scans in the top five
+versus 305 for warmup 60—only one query difference. Warmup 60 is preferred by the
+predeclared loss criterion, not by every metric.
+
+### Retained checkpoints: ImageNet initialization has the clearest advantage
+
+All three retained checkpoints use LR 5e-5, warmup 60. The A/B/C checkpoint files
+were opened on CPU and their trial names, selection values and epochs verified
+against the epoch logs and campaign status.
+
+| Run | Saved epoch / optimizer update | Text→image R@1 | R@5 hits | Text→image R@10 | Median paired-scan rank ↓ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A | 12 / 252 | 0.81% | 94/2,466 | 6.69% | 232 |
+| B | 14 / 294 | 0.81% | 89/2,466 | 7.18% | 219 |
+| C | 15 / 315 | 3.93% | 305/2,466 | 19.63% | 64 |
+
+C improves R@5 over A by **8.56 percentage points** (about 3.24×) at the retained
+checkpoints. C also has lower validation loss and higher R@5 in both retrieval
+directions at every matched LR/warmup setting. This supports pretrained image
+initialization for the next baseline, although performance remains far from
+reliable exact-scan retrieval.
+
+B's effect is mixed: it slightly improves A's global loss and text→image R@5 at
+LR 5e-5/warmup 20, but performs worse on those metrics at warmup 60. At the
+retained checkpoints, B has better R@10 and median rank but worse R@5 than A.
+This does not establish a consistent benefit from local loss, nor rule one out
+with other weights or pretrained images. ImageNet + local was **not tested**.
+B's retained local validation loss is 4.8068, and its weighted total is 5.2249;
+these are different objectives and must not be compared directly with A/C's
+global-only loss.
+
+### Early stopping caught modest late validation deterioration
+
+The curves show a strong learning-rate difference and small late reversals in
+the high-LR runs. All six low-LR runs completed 20 epochs; all six high-LR runs
+stopped after three non-improving validation checks. Circles mark each trial's
+minimum; panels share the same focused loss scale.
+
+![Global validation loss across all twelve trials](figures/hpo_20261002_validation.png)
+
+For the retained settings, global validation loss rises from **4.6681→4.6871**
+(A, epochs 12→15), **4.7442→4.7787** (B, 14→17), and **3.7766→3.7888**
+(C, 15→18). Over those intervals, true epoch-average training global loss falls
+4.8406→4.5374, 4.5474→4.3541 and 3.1895→3.0478, respectively. These opposite
+trends are consistent with modest late overfitting; they do not imply a large
+collapse. Training uses 512 candidates and validation up to 256, so absolute
+train/validation loss levels should not be compared. Console parenthesized
+values are an EMA; this diagnosis uses the explicit end-of-epoch averages.
+
+### Next comparison and limits
+
+Use C's retained checkpoint and LR 5e-5/warmup 60 as the reference for this
+ResNet34 setup. Repeat with additional seeds and evaluate a frozen selection on
+the untouched test split before claiming generalization. The same validation set
+selected both epochs and hyperparameters, so these scores are selection-biased;
+no confidence intervals or significance claims are warranted from this run alone.
+Loss-selected checkpoints can miss peak R@5: C/warmup 60 peaks at 12.65% in epoch
+16, but that epoch was not retained because its global loss was worse.
+
+For the next architecture study, compare ResNet50 concatenation with ResNet50
+attention under matched conditions; test pretrained DINO as a separate backbone
+change. These experiments have not been launched by this analysis. Open questions
+are whether local alignment helps a pretrained image encoder, whether better
+fusion improves retrieval, and whether clinically similar unpaired reports affect
+the exact-scan metric. These require additional experiments or annotations.
+
+Evidence: `.local/pet/logs/hpo-20261001-abc-1gpu/` contains the completed campaign
+`status.json`, per-trial `params.txt`, `out.log`, and `checkpoints/results.jsonl`.
+`completed_summary.csv` and `completed_summary.json` contain the verified values,
+curves and source hashes; `summarize_completed.py` reproduces them and the figure.
+Exactly **three** checkpoints remain, `A/best.pt`, `B/best.pt`, `C/best.pt`, about
+1.56 GB each (4.68 GB total). This analysis created no additional model checkpoint.
+
+## Shared ResNet50 and spatial attention fusion — 2026-10-01
+
+**Status: implemented and CPU-tested; not trained or added to the A/B/C HPO
+campaign.** Following the user's choice, this replaces the earlier ResNet34 fusion
+proposal with a shared ResNet50. Existing concatenation models remain available.
+
+| Stage | Shape per scan at 224×224 | Implementation |
+| --- | --- | --- |
+| Independent coronal/sagittal inputs | 2×1×224×224 | Existing PET dataset and normalization |
+| One shared ResNet50 | 2×2048×7×7 | Both views batched through the same backbone |
+| Spatial token projection | 98×256 | Linear projection, LayerNorm, learned view IDs and fixed normalized 2D sinusoidal positions |
+| Joint attention | 98×256 | Two pre-normalized self-attention/MLP blocks; eight heads, MLP ratio 4, dropout 0.1 |
+| Learned-query pooling | 8×256 → 256 | Eight learned queries attend to all spatial tokens; residual, LayerNorm, then mean |
+| CLIP projection | 512 | Linear projection; normalized for contrastive matching |
+
+Attention connects features both within and between views. Fusion occurs before
+global pooling. A region token retains its view/grid index, but its content includes
+context from both images. Positions are within-view coordinates, not asserted 3D
+correspondences. Tokens are overlapping CNN receptive fields, not lesion crops;
+attention weights alone do not establish visual grounding.
+
+New models: `PET-ResNet50-BioClinicalBERT-Attention` (global) and
+`PET-ResNet50-BioClinicalBERT-Attention-Local` (global + 0.1 local).
+The local variant aligns the **post-attention spatial tokens**, projected 256→128,
+with report tokens; it does not align the eight pooled summary queries. Both use
+the existing pretrained, trainable Bio_ClinicalBERT and windowed context 1024.
+PET intensity normalization, canvas 310 and RAM data loading are unchanged.
+At 310-pixel inference, the backbone produces two 10×10 grids (200 tokens);
+position encodings are generated for that grid. Compatibility was tested, but
+higher-resolution inference accuracy has not been evaluated.
+
+`scripts/train_pet_attention_1gpu.sh` launches global-only training on GPU 0 by
+default: ImageNet image initialization, BF16, batch 256 × accumulation 2 = 512,
+LR 1e-5, warmup 20 updates, maximum 20 epochs, patience 3, one best checkpoint
+selected by global validation loss. These are starting settings, not optimized
+settings or a verified GPU memory fit. `PET_PRETRAINED_IMAGE=0` selects a scratch
+image backbone; fusion always initializes randomly. Additional CLI arguments
+override defaults; select the local model with `--model
+PET-ResNet50-BioClinicalBERT-Attention-Local`. No training was launched here.
+
+Implementation: `src/open_clip/multiview_attention.py`, `timm_model.py`, vision
+configuration in `model.py`, and the optional branch in `local_region.py`.
+Fusion participates in layer grouping/freezing and activation checkpointing.
+**Validation: 48 CPU tests passed**, including the new attention tests, existing
+multiview/Bio_ClinicalBERT/local-loss tests, two-process Gloo gradient regression,
+cached accumulation, and best-checkpoint selection. Tests cover gradients through
+both views, cross-view interaction, spatial/view identity, all trainable parameters,
+BF16 autocast, dropout/checkpoint consistency, 224/310 inputs and strict checkpoint
+round trips. Tiny local pretrained BERT fixtures avoid downloading weights.
+GPU memory, throughput, full-batch training and PET retrieval remain unmeasured
+for this architecture; benchmark before scheduling a full run.
+
+## Focused literature review: multi-view feature fusion — 2026-10-01
+
+The general CNN → spatial features → attention fusion design has clear precedents.
+This is a targeted primary-source review, not an exhaustive novelty search. The
+papers below support testing the design; their tasks and metrics do not establish
+that it will improve our PET–report retrieval.
+
+| Prior work | What is fused and how | Relationship to this implementation |
+| --- | --- | --- |
+| [van Tulder et al., 2021, Cross-View Transformers](https://arxiv.org/html/2103.11390v2) | Unregistered mammogram or frontal/lateral CXR feature maps; bidirectional cross-attention before the last ResNet18 stage. Image branches **do not share weights**. | Closest spatial-fusion precedent. Compares directly with pooled concatenation. Our shared ResNet50 and joint self-attention after the final stage are adaptations. |
+| [CXR-CLIP, 2023](https://arxiv.org/html/2310.13292v1) | ResNet50/Swin-Tiny plus BioClinicalBERT; multiple study images and report sections linked by image–text, image–image and text–text contrastive objectives. Image representations are globally pooled. | Strong medical CLIP comparator. Multi-view supervision here does not implement joint spatial attention fusion. |
+| [MLRG, CVPR 2025](https://arxiv.org/html/2502.20056v1) | RAD-DINO visual features with view/time embeddings; anchor-view queries cross-attend to other current views and a prior image. Contrastive pretraining precedes report generation. | Connects learned multi-view feature fusion to image–report alignment; differs in backbone, temporal inputs and generation objective. |
+| [Set Transformer, ICML 2019](https://proceedings.mlr.press/v97/lee19d/lee19d.pdf) | Attention between set elements and pooling using learned seed queries. | Basis for our learned-query pooling. Our view/position tags add image structure; our head is a simplified adaptation, not an exact reproduction. |
+| [LASM-mMIP, EJNMMI Research 2026](https://link.springer.com/article/10.1186/s13550-025-01357-w) | Four PET MIP views, parallel ResNet18 encoders and **averaged prediction probabilities**; lymphoma staging in 227 patients with five-fold cross-validation. | Direct PET/MIP precedent, but late decision fusion rather than attention or report contrastive learning. |
+
+The cross-view transformer study reports mean CheXpert AUC 0.834 versus 0.829
+for pooled concatenation; gains vary by finding. This is classification evidence,
+not an expected PET retrieval improvement. [Study results, Table 2](https://arxiv.org/html/2103.11390v2).
+MLRG also treats identical reports across visits as multiple positives, identifying
+an alternative loss-design direction worth auditing separately from fusion.
+[MLRG, §3.2](https://arxiv.org/html/2502.20056v1).
+
+The previously discussed [MICCAI 2026 PET/CT report-generation paper](https://papers.miccai.org/miccai-2026/paper/0238_paper.pdf)
+aggregates localized 3D lesion features with Set Transformer. Our available inputs
+are two whole-body 2D MIPs, so lesion localization and volumetric inputs would be
+needed to reproduce that pipeline.
+
+**Experimental interpretation:** shared weights are a reasonable parameter-saving
+choice for two views of the same PET modality, but are not proven optimal here.
+To attribute a gain to fusion, compare ResNet50 + pooled concatenation against
+ResNet50 + attention with matched initialization, text encoder, data, loss, effective
+batch and training budget. Comparing only with current ResNet34 changes two factors.
+Begin with global loss, then separately test local alignment. Compare validation
+loss, full-gallery retrieval, GPU memory and time; inspect small-lesion sensitivity
+before increasing attention depth. The review does not support a novelty claim
+for CNN/attention fusion itself.
+
+## Historical snapshot: first completed HPO trials — 2026-10-01
+
+This interim snapshot is superseded by the completed comparison above.
+
+The saved A/B checkpoints retrieve the paired PET scan in the top five for only
+about 1% of validation reports. They outperform uniform random ranking but remain
+weak for exact-scan retrieval; the local objective has not improved this metric in
+the first tested configuration. This snapshot covers the completed **LR 1e-5,
+warmup 20** trials only. C and the other hyperparameter trials are still pending.
+
+Each of the 2,466 validation reports ranks all 2,466 PET scan embeddings (both views
+fused). Recall@5 counts whether the designated paired scan is among the first five;
+0.01 is **1%**, not 0.01%. Uniform random ranking would average 5/2,466 = **0.203%**.
+
+| Saved checkpoint | Epoch | Global validation loss | Text→image R@5 | Successful reports | Median paired-scan rank |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A: scratch/global | 19 | 5.1172 | 1.338% | 33/2,466 | 512 |
+| B: scratch/global + 0.1 local | 19 | 5.1241 | 1.095% | 27/2,466 | 509 |
+
+At the last epoch (20), A/B R@5 were 1.298% and 1.176%, respectively. Those dashboard
+values describe the final epoch, while retained checkpoints minimize global
+validation loss. B's peak R@5 was 1.257% at epoch 15, so lower loss does not necessarily
+select peak retrieval. The six-report difference between the saved A/B checkpoints
+is descriptive; no statistical advantage is established from this single-seed run.
+
+Both validation losses improved from about 5.515 at epoch 1 to their minima at
+19, while final training global losses were 5.7268 (A) and 5.7345 (B). Thus these
+curves do not establish a sustained overfitting increase. Training uses 512
+contrastive candidates; validation loss uses within-batch candidates up to 256,
+while retrieval searches the full 2,466-scan gallery. The raw train/validation loss
+levels are therefore not directly comparable. Low LR/limited updates is a plausible
+constraint, not a verified cause; the scheduled 5e-5 trials test a larger learning
+rate. Similar reports and multiple scans can also make exact-scan matching demanding,
+but their contribution has not been measured here.
+
+Continue the existing grid and compare both retrieval and loss at retained
+checkpoints before choosing hyperparameters. If all conditions remain weak, a
+small-pair memorization check and direct scan/report identity audit can distinguish
+optimization problems from pairing or preprocessing issues. The question of whether
+retrieved mismatches are clinically similar requires a separate reviewed evaluation.
+No running experiment was modified for this diagnostic.
+
+Evidence: `checkpoints/results.jsonl` and `out.log` for the A/B first trials under
+`.local/pet/logs/hpo-20261001-abc-1gpu/trials/`; exact selected/peak/final metrics
+and source paths in `retrieval_diagnostic_20261001.json` in the campaign directory.
+The definition was checked against `src/open_clip_train/metrics.py` (paired ranks,
+R@k as the fraction with zero-based rank < k). This subsection uses the existing
+user-requested Markdown report as the durable technical report surface, combining
+summary, definitions, evidence, limitations and next steps.
+
+## A/B/C learning-rate and warmup search — 2026-10-01
+
+Requested ablations retain pretrained, trainable Bio_ClinicalBERT in every case:
+
+| Experiment | Image initialization | Loss |
+| --- | --- | --- |
+| A | Scratch ResNet34 | Global only |
+| B | Scratch ResNet34 | Global + 0.1 × local |
+| C | ImageNet ResNet34 (`timm/resnet34.a1_in1k`) | Global only |
+
+C uses timm's pretrained RGB first-convolution weights summed across channels for
+single-channel PET. Exact equality of the adapted first convolution and an internal
+ResNet layer against the pretrained source was checked. PET intensity normalization
+and preprocessing remain identical across all three conditions.
+
+The grid has four trials per experiment: LR `{1e-5, 5e-5}` × warmup `{20, 60}`
+optimizer steps. Following the user's request to leave a GPU available, all use
+**GPU 0 only**, batch 256 and **two-step accumulation** (512 contrastive pairs per
+optimizer update), BF16, seed 0, context 1024, 224/224 images, split0, weight decay
+0.1, and a cosine
+schedule with a maximum of 20 epochs (420 updates). Warmup therefore spans about
+4.8% or 14.3% of the full schedule. B uses local chunk 32 and up to 128 text tokens.
+
+Selection and early stopping minimize **global validation loss (`clip_val_loss`)**
+on the full 2,466-pair validation split, avoiding a different selection objective
+for B. Stop a trial after three successive validation checks without a new minimum.
+Retrieval metrics and B's local/combined losses remain logged. No test-set tuning.
+This small single-seed grid finds the best observed configuration, not a guaranteed
+optimum or a statistically conclusive comparison.
+
+`scripts/run_pet_hpo.py` runs trials sequentially and interleaves A/B/C. Each
+experiment has a single shared `best.pt` across all four trials, with model,
+optimizer, selected metric/epoch, and trial arguments. Atomic replacement preserves
+the prior best on a write failure, temporarily requiring one extra checkpoint's
+space. Normal epoch/latest checkpoints are disabled. A 4 GiB free-space check
+runs before each trial. Complete terminal stderr, metrics, commands, and source
+snapshots are retained. W&B project: `pet-bioclinicalbert-hpo`; LR logged every step.
+
+Completed single-GPU campaign output: `.local/pet/logs/hpo-20261001-abc-1gpu/`,
+with final `status.json`,
+`report.md`, trial logs, and selected `A/best.pt`, `B/best.pt`, `C/best.pt`.
+The earlier two-GPU campaign (`hpo-20261001-abc`) launched at 12:49 and was
+stopped at the user's request before a checkpoint was saved. Its logs are preserved.
+The user then authorized continuing on one GPU with accumulation; the first trial
+was restarted from initialization, using a new output directory. All 12 trials
+completed successfully; final winners and comparisons are recorded above.
+The campaign report was generated automatically as trials finished.
+W&B: https://wandb.ai/lingkai1999-chalmers-university-of-technology/pet-bioclinicalbert-hpo .
+An initial launch lost its parent session during cache loading, before training;
+its workers were stopped and its logs preserved in the `-launch-interrupted` sibling
+directory before restarting the campaign.
+
+The old shared CUDA environment had been removed. Restored PyTorch 2.10.0+cu128,
+torchvision 0.25.0+cu128, transformers 5.16.1, and training dependencies directly in
+`.local/pet-cuda-venv`, keeping downloads temporary in RAM to avoid a disk cache.
+Checkpoint/early-stopping, accumulation, and PET model/loss/evaluation
+unit tests: **44 passed**, including a simulated complete 12-trial
+search verifying the three retained winners and their parameter selections. Two-A6000 BF16 smokes at 256/GPU passed for B and C,
+including global/local validation, synchronized early stopping after a controlled
+metric worsened, retaining the earlier best, and loading the saved checkpoint.
+Smoke checkpoint files were removed after verification.
+
+Single-GPU PET accumulation caches two encoder microbatches, evaluates the loss
+once over their concatenated features, then replays each microbatch using its
+feature gradients. Global and local losses both see all **512 candidate pairs**
+(511 negatives per anchor); this is not an average of independent 256-pair losses.
+Replay restores the original PyTorch RNG state for BERT dropout and preserves
+BatchNorm running buffers so caching/replay does not double their updates. Scalar
+gradients (e.g. logit scale) are applied once. Tests compare losses, all parameter
+gradients/updates, RNG progression and BatchNorm buffers against a reference that
+retains both microbatch graphs; both global/local and gradient-scaled paths pass.
+BatchNorm statistics still come from each physical microbatch, not a single
+512-pair encoder forward. Region accumulation is enabled for single-GPU PET only.
+Single-A6000 BF16 smokes passed for both B and C at batch 256 with accumulation 2,
+including validation and best-checkpoint loading. B also passed controlled early
+stopping. Saved counters confirmed one optimizer step and 512 samples; GPU 1
+remained unused. The smoke checkpoints were removed after verification.
+
 
 ## Checkpoint storage update — 2026-09-30
 

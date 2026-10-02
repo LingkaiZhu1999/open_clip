@@ -1,0 +1,41 @@
+{
+    "embed_dim": 512,
+    "vision_cfg": {
+        "image_size": 224,
+        "timm_model_name": "resnet50",
+        "timm_model_pretrained": false,
+        "timm_pool": "avg",
+        "timm_proj": "linear",
+        "timm_model_kwargs": {
+            "in_chans": 1
+        },
+        "timm_num_views": 2,
+        "timm_view_fusion": "attention",
+        "timm_view_fusion_cfg": {
+            "width": 256,
+            "layers": 2,
+            "heads": 8,
+            "num_queries": 8,
+            "mlp_ratio": 4.0,
+            "dropout": 0.1
+        }
+    },
+    "text_cfg": {
+        "context_length": 1024,
+        "hf_model_name": "emilyalsentzer/Bio_ClinicalBERT",
+        "hf_model_pretrained": true,
+        "hf_tokenizer_name": "emilyalsentzer/Bio_ClinicalBERT",
+        "hf_proj_type": "linear",
+        "hf_pooler_type": "mean_pooler",
+        "hf_model_config": {
+            "cls_token_id": 101,
+            "sep_token_id": 102,
+            "use_cache": false
+        },
+        "tokenizer_kwargs": {
+            "do_lower_case": false
+        },
+        "hf_windowed": true
+    },
+    "custom_text": true
+}

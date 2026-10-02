@@ -69,7 +69,8 @@ class CLIPVisionCfg:
     scale_fc: bool = False  # apply layer norm in MLP block
 
     timm_num_views: int = 1  # independently encode views with a shared backbone
-    timm_view_fusion: str = 'mean'  # mean normalized embeddings or concatenate before projection
+    timm_view_fusion: str = 'mean'  # mean, pooled concat, or spatial attention fusion
+    timm_view_fusion_cfg: Optional[dict] = None  # width, layers, heads, num_queries, mlp_ratio, dropout
     timm_model_name: Optional[str] = None  # a valid model name overrides layers, width, patch_size
     timm_model_pretrained: bool = False  # use (imagenet) pretrained weights for named model
     timm_pool: str = 'avg'  # feature pooling for timm model ('abs_attn', 'rot_attn', 'avg', '')
@@ -237,6 +238,7 @@ def _build_vision_tower(
             output_tokens=vision_cfg.output_tokens,
             num_views=vision_cfg.timm_num_views,
             view_fusion=vision_cfg.timm_view_fusion,
+            view_fusion_cfg=vision_cfg.timm_view_fusion_cfg,
         )
     elif vision_cfg.naflex_patch_interp:
         raise ValueError(

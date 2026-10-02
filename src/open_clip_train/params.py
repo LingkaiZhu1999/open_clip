@@ -964,7 +964,27 @@ def parse_args(args):
              "limit torch.compile recompiles (the token-axis analogue of --naflex-pad-multiple)."
     )
 
+    parser.add_argument('--save-best-only', action='store_true',
+                        help='Save only best.pt by a minimized validation metric; fresh non-FSDP runs only.')
+    parser.add_argument('--best-metric', default='clip_val_loss')
+    parser.add_argument('--best-checkpoint-path', default=None,
+                        help='Optional shared best checkpoint path across sequential HPO trials.')
+    parser.add_argument('--best-checkpoint-threshold', type=float, default=float('inf'),
+                        help='Only replace the shared checkpoint below this prior trial score.')
+    parser.add_argument('--early-stopping-patience', type=int, default=0,
+                        help='Stop after this many validation checks without improvement; 0 disables.')
+
     args = parser.parse_args(args)
+    if args.early_stopping_patience < 0:
+        raise ValueError('--early-stopping-patience must be nonnegative.')
+    if args.early_stopping_patience and not args.save_best_only:
+        raise ValueError('--early-stopping-patience requires --save-best-only.')
+    if args.save_best_only and (args.fsdp or args.resume or not args.val_data
+                               or args.val_frequency != 1 or args.logs.lower() == 'none'
+                               or args.save_most_recent or args.delete_previous_checkpoint):
+        raise ValueError('--save-best-only requires a fresh non-FSDP run, paired validation every epoch, '
+                         'logs enabled, and no latest/delete-previous checkpoint flags.')
+
 
     # Guard here (not just in NaFlexBatchScheduler) so the collate-only variable-text paths that bypass the
     # scheduler (standard CLAP / synthetic / plain CLIP) also reject non-positive values.

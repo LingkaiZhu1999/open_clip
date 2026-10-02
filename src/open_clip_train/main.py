@@ -31,6 +31,7 @@ from open_clip.task import (
     save_sharded_checkpoint,
     unwrap_model,
 )
+from open_clip_train.best_checkpoint import ValidationTracker, atomic_save_checkpoint
 from open_clip_train.data import get_data
 from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object, all_gather_object
 from open_clip_train.naflex_data import (
@@ -231,7 +232,8 @@ def main(args):
             chunk_size=args.pet_region_chunk_size).items() if value is not None
     }
     if region_overrides:
-        if args.model not in ('PET-ResNet34-Local', 'PET-ResNet34-BioClinicalBERT-Local'):
+        if args.model not in ('PET-ResNet34-Local', 'PET-ResNet34-BioClinicalBERT-Local',
+                              'PET-ResNet50-BioClinicalBERT-Attention-Local'):
             raise ValueError('PET region overrides require a PET local-alignment model')
         from open_clip import get_model_config
         region_config = get_model_config(args.model)['region_cfg']
@@ -647,6 +649,8 @@ def main(args):
         evaluate(train_state.task, data, train_state.epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
+    validation_tracker = ValidationTracker(patience=args.early_stopping_patience)
+    retained_best = args.best_checkpoint_threshold
     for epoch in range(train_state.epoch, args.epochs):
         train_state.epoch = epoch
         if is_master(args):
@@ -655,11 +659,41 @@ def main(args):
         train_one_epoch(train_state, data, args, tb_writer=writer)
         completed_epoch = epoch + 1
 
+        metrics = {}
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2', 'audio-zeroshot')):
-            evaluate(train_state.task, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            metrics = evaluate(train_state.task, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
             # sync to avoid some processes advancing/exiting while rank 0 finishes eval
             if args.distributed:
                 torch.distributed.barrier()
+
+        if args.save_best_only:
+            stop = False
+            if is_master(args):
+                if args.best_metric not in metrics:
+                    raise ValueError(f'Missing validation metric {args.best_metric!r}.')
+                score = float(metrics[args.best_metric])
+                improved, stop = validation_tracker.update(score, completed_epoch)
+                if improved and score < retained_best:
+                    checkpoint = save_checkpoint(
+                        train_state.task, train_state.optimizer, epoch=completed_epoch,
+                        scaler=train_state.scaler, name=args.name,
+                        global_step=train_state.global_step, samples_seen=train_state.samples_seen)
+                    checkpoint['selection'] = dict(metric=args.best_metric, value=score,
+                                                   epoch=completed_epoch, args=vars(args))
+                    path = args.best_checkpoint_path or os.path.join(args.checkpoint_path, 'best.pt')
+                    atomic_save_checkpoint(checkpoint, path)
+                    retained_best = score
+                    _logger.info('Saved best checkpoint: %s, %s=%.6f, epoch=%d',
+                                 path, args.best_metric, score, completed_epoch)
+                _logger.info('Validation selection: best=%.6f at epoch %d; non-improving checks=%d/%d',
+                             validation_tracker.best, validation_tracker.best_epoch,
+                             validation_tracker.bad_checks, validation_tracker.patience)
+            if args.distributed:
+                stop = broadcast_object(args, stop)
+            if stop:
+                _logger.info('Early stopping after epoch %d.', completed_epoch)
+                break
+            continue
 
         # Saving checkpoints.
         sharded_ckpt = args.fsdp and args.fsdp_checkpoint == 'sharded'

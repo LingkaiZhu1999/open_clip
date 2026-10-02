@@ -2,7 +2,7 @@
 
 Uses contextual subword tokens from native CLIP or an HF text encoder
 (not GLoRIA's explicit word aggregation).
-The global concatenation branch remains unchanged. Local matching uses all
+Global fusion supports pooled concatenation or spatial attention. Local matching uses all
 cross-rank negatives, with checkpointed chunks to bound attention memory.
 """
 import math
@@ -33,8 +33,8 @@ def configure_region_branch(model, config):
             raise ValueError(f'region_cfg {key} must be finite and positive')
     visual = model.visual
     if not (isinstance(visual, TimmModel) and visual.num_views == 2
-            and visual.view_fusion == 'concat' and hasattr(visual.trunk, 'layer4')):
-        raise ValueError('region_cfg requires a two-view concat timm ResNet')
+            and visual.view_fusion in ('concat', 'attention') and hasattr(visual.trunk, 'layer4')):
+        raise ValueError('region_cfg requires a two-view concat or attention timm ResNet')
     if hasattr(model, 'text'):
         from .hf_model import HFTextEncoder, MeanPooler
         if not isinstance(model.text, HFTextEncoder) or not isinstance(model.text.pooler, MeanPooler):
@@ -47,7 +47,9 @@ def configure_region_branch(model, config):
             raise ValueError('Native region alignment requires the standard CLIP BPE tokenizer and EOT argmax pooling')
         width = model.token_embedding.embedding_dim
     model.region_cfg = defaults
-    model.region_image_projection = nn.Linear(visual.trunk.num_features, defaults['dim'], bias=False)
+    region_width = (visual.head.fusion.width if visual.view_fusion == 'attention'
+                    else visual.trunk.num_features)
+    model.region_image_projection = nn.Linear(region_width, defaults['dim'], bias=False)
     model.region_text_projection = nn.Linear(width, defaults['dim'], bias=False)
 
 
@@ -59,10 +61,14 @@ def encode_image_regions(model, image):
     spatial = model.visual.trunk.forward_features(image.flatten(0, 1))
     if spatial.ndim != 4:
         raise ValueError('Local PET encoding requires NCHW spatial features')
-    pooled = model.visual.trunk.forward_head(spatial)
-    global_features = model.visual.head(pooled.reshape(batch, -1))
-    regions = model.region_image_projection(spatial.permute(0, 2, 3, 1))
-    regions = regions.reshape(batch, 2, *regions.shape[1:])
+    if model.visual.view_fusion == 'attention':
+        global_features, regions = model.visual.fuse_spatial_features(spatial, return_tokens=True)
+        regions = model.region_image_projection(regions)
+    else:
+        pooled = model.visual.trunk.forward_head(spatial)
+        global_features = model.visual.head(pooled.reshape(batch, -1))
+        regions = model.region_image_projection(spatial.permute(0, 2, 3, 1))
+        regions = regions.reshape(batch, 2, *regions.shape[1:])
     return F.normalize(global_features, dim=-1), F.normalize(regions, dim=-1)
 
 

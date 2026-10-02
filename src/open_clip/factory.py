@@ -1195,9 +1195,11 @@ def create_task(args, model, dist_model=None, naflex_data_config=None):
     if region_cfg is not None:
         if task_cls is not CLIPTask:
             raise ValueError('Region alignment currently supports CLIPTask only')
-        if (getattr(args, 'accum_freq', 1) != 1 or getattr(args, 'fsdp', False)
-                or getattr(args, 'torchcompile', False)):
-            raise ValueError('Region alignment requires accum_freq=1, eager execution, and DDP (not FSDP)')
+        if getattr(args, 'fsdp', False) or getattr(args, 'torchcompile', False):
+            raise ValueError('Region alignment requires eager execution without FSDP')
+        if getattr(args, 'accum_freq', 1) > 1 and (
+                getattr(args, 'world_size', 1) != 1 or getattr(args, 'dataset_type', None) != 'pet'):
+            raise ValueError('Region gradient accumulation currently requires single-GPU PET training')
     task = (task_cls(model, dist_model, **options) if task_cls is DistillCLIPTask
             else task_cls(model, **options))
     if naflex_data_config is not None:
